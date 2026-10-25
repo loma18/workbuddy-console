@@ -62,6 +62,9 @@ import { listBackups, restoreBackup, deleteBackup, cleanBackups, backupVariants 
 import { registerProxyRoutes, refreshModelsCache } from './proxy/index.mjs';
 import { stopWorkbuddy, launchWorkbuddy } from './targets/workbuddy.mjs';
 import { listSessionsForSwitch, copySessions } from './workbuddy/sessions.mjs';
+import { startLanSync, stopLanSync, lanSyncStatus, lanAddresses } from './lansync/server.mjs';
+import { pendingSummary, clearPending } from './lansync/state.mjs';
+import { generatePairCode, PROTOCOL_VERSION } from './lansync/protocol.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1139,10 +1142,121 @@ startCheckinPatrol();
 // 反向代理已开启时，启动时预热一次模型缓存（失败不阻塞启动，页面可手动刷新）
 if (loadConfig().proxy?.enabled) refreshModelsCache().catch(() => {});
 
+/* ---------------- 手机同步（局域网） ---------------- */
+
+/**
+ * 同步服务是**独立进程内实例**，跑在自己的端口上（默认 57900），与主服务互不干扰。
+ * 这里只负责"按配置启停"和"给设置页提供状态"。
+ */
+let lanSyncService = null;
+
+function lanSyncPayload() {
+  const s = loadConfig().settings.lanSync;
+  const st = lanSyncStatus();
+  return {
+    ok: true,
+    protocol: PROTOCOL_VERSION,
+    enabled: !!s.enabled,
+    port: s.port,
+    refreshOnPush: !!s.refreshOnPush,
+    // 配对码必须明文回给界面：用户要照着它输入到手机里
+    pairCode: s.pairCode || '',
+    running: st.running,
+    listeningPort: st.port,
+    addresses: st.addresses,
+    pending: pendingSummary(),
+  };
+}
+
+async function applyLanSyncConfig() {
+  const s = loadConfig().settings.lanSync;
+  // 没开或没配对码：一律不监听。没有配对码就等于无鉴权裸奔，这种状态宁可不启动。
+  if (!s.enabled || !s.pairCode) {
+    await stopLanSync();
+    lanSyncService = null;
+    return lanSyncPayload();
+  }
+  // 端口没变且已在跑：不重启，避免把手机正在用的连接掐断
+  if (lanSyncService && lanSyncService.port === s.port) return lanSyncPayload();
+
+  await stopLanSync();
+  lanSyncService = null;
+  try {
+    lanSyncService = await startLanSync({
+      port: s.port,
+      getPairCode: () => loadConfig().settings.lanSync.pairCode,
+      getRefreshOnPush: () => !!loadConfig().settings.lanSync.refreshOnPush,
+      onLog: (m) => console.log(`[lansync] ${m}`),
+    });
+  } catch (err) {
+    console.error(`[lansync] 启动失败（端口 ${s.port}）:`, err?.message || err);
+    lanSyncService = null;
+    return { ...lanSyncPayload(), error: err?.message || String(err) };
+  }
+  return lanSyncPayload();
+}
+
+app.get('/api/lansync/status', (req, res) => {
+  res.json(lanSyncPayload());
+});
+
+app.put(
+  '/api/lansync/settings',
+  wrap(async (req, res) => {
+    const cfg = loadConfig();
+    const s = cfg.settings.lanSync;
+
+    if (typeof req.body?.enabled === 'boolean') s.enabled = req.body.enabled;
+    if (req.body?.port !== undefined) {
+      const p = Number(req.body.port);
+      if (!Number.isInteger(p) || p < 1024 || p > 65535) {
+        return res.status(400).json({ error: '端口需在 1024–65535 之间' });
+      }
+      if (p === PORT) {
+        return res.status(400).json({ error: `端口 ${p} 已被控制台主服务占用，请换一个` });
+      }
+      s.port = p;
+    }
+    if (typeof req.body?.refreshOnPush === 'boolean') s.refreshOnPush = req.body.refreshOnPush;
+    // 首次开启时自动发一个配对码，省得用户面对一个"开了但用不了"的开关
+    if (!s.pairCode) s.pairCode = generatePairCode();
+
+    saveConfig(cfg);
+    res.json(await applyLanSyncConfig());
+  })
+);
+
+app.post(
+  '/api/lansync/code/rotate',
+  wrap(async (req, res) => {
+    const cfg = loadConfig();
+    cfg.settings.lanSync.pairCode = generatePairCode();
+    saveConfig(cfg);
+    const payload = await applyLanSyncConfig();
+    res.json({ ...payload, pairCode: cfg.settings.lanSync.pairCode });
+  })
+);
+
+app.post('/api/lansync/pending/clear', (req, res) => {
+  const r = clearPending();
+  res.json({ ok: !!r.ok, ...lanSyncPayload() });
+});
+
 /* ---------------- 反向代理（OpenAI 兼容，供其他 agent 调用） ---------------- */
 
 // 必须挂在静态资源与 SPA 兜底之前，否则 /v1/* 会被 index.html 吃掉
 registerProxyRoutes(app, { port: PORT });
+
+/**
+ * 按配置启停手机同步服务。失败只影响同步功能，绝不能让控制台起不来——
+ * 用户可能只是恰好把端口填成了别的程序在用的值。
+ */
+applyLanSyncConfig()
+  .then((p) => {
+    if (p?.error) console.error(`[lansync] 未能启动：${p.error}`);
+    else if (p?.running) console.log(`[lansync] 已就绪，等待手机连接 0.0.0.0:${p.listeningPort}`);
+  })
+  .catch((e) => console.error('[lansync] 初始化异常:', e?.message || e));
 
 /* ---------------- 静态资源 + SPA ---------------- */
 

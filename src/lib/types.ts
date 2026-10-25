@@ -853,3 +853,39 @@ export interface ProxyTestResult {
   preview?: string;
   error?: string;
 }
+
+/* ---------------- 手机同步（局域网） ---------------- */
+
+/** 本机局域网地址（设置页展示"手机该填哪个"） */
+export interface LanSyncAddress {
+  iface: string;
+  address: string;
+  cidr: string;
+}
+
+/** 待回传队列摘要（不含任何 token） */
+export interface LanSyncPendingSummary {
+  count: number;
+  oldestAt: number | null;
+  newestAt: number | null;
+  uids: string[];
+}
+
+export interface LanSyncStatus {
+  ok: boolean;
+  protocol: number;
+  /** 用户是否开启（配置项） */
+  enabled: boolean;
+  /** 配置的端口 */
+  port: number;
+  refreshOnPush: boolean;
+  /** 配对码明文：用户要照着它输入到手机里 */
+  pairCode: string;
+  /** 服务是否真的在监听 */
+  running: boolean;
+  listeningPort: number | null;
+  addresses: LanSyncAddress[];
+  pending: LanSyncPendingSummary;
+  /** 启动失败原因（端口被占用等） */
+  error?: string;
+}

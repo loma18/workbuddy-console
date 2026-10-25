@@ -10,6 +10,22 @@ export const CONFIG_DIR = process.env.FREE_TOKEN_CONFIG_DIR
 export const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 export const CACHE_DIR = path.join(CONFIG_DIR, 'cache');
 
+/**
+ * 手机同步（局域网）：让 fewards 把 refresh_token 推过来、把刷新结果拉回去。
+ *
+ * **默认关闭**。和 `proxy.enabled` 一样，这属于"对外暴露能力"：一旦打开，同网段的
+ * 设备就能向本机提交凭据。必须由用户明确打开，且配了配对码才允许启动。
+ */
+export const DEFAULT_LANSYNC = {
+  enabled: false,
+  /** 监听端口；与主服务的 57891 分开，避免把控制台 UI / 反向代理暴露到局域网 */
+  port: 57900,
+  /** 配对码：空表示未初始化，服务拒绝启动（否则等于无鉴权裸奔） */
+  pairCode: '',
+  /** 收到推送后是否立刻刷新；关闭时只入库，等用户手动刷 */
+  refreshOnPush: false,
+};
+
 const DEFAULT_SETTINGS = {
   workbuddyDir: '', // 覆盖默认 ~/.workbuddy
   proxyUrl: '', // 出站代理（如 http://127.0.0.1:7890）；留空自动探测环境变量 / Windows 系统代理
@@ -71,7 +87,13 @@ export function loadConfig() {
     const cfg = {
       ...structuredClone(DEFAULT_CONFIG),
       ...raw,
-      settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        ...(raw.settings || {}),
+        // 嵌套对象必须单独合并：直接展开会被 raw 里的半截 lanSync 整个替换，
+        // 用户只存了 { enabled: true } 时 port / pairCode 就丢了。
+        lanSync: { ...DEFAULT_LANSYNC, ...(raw.settings?.lanSync || {}) },
+      },
       activeKeys: { ...(raw.activeKeys || {}) },
       proxy: { ...DEFAULT_PROXY, ...(raw.proxy || {}) },
     };

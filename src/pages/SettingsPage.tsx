@@ -33,6 +33,7 @@ import type {
   CheckinState,
   CheckinStatusResponse,
   DetectResult,
+  LanSyncStatus,
   LoadedInfo,
   PermissionCheck,
   PermissionResponse,
@@ -805,6 +806,9 @@ export default function SettingsPage() {
         </Card>
       </PageSection>
 
+      {/* 手机同步（局域网） */}
+      <LanSyncSection />
+
       {/* WorkBuddy 数据目录 */}
       <PageSection
         icon={<IconDatabase />}
@@ -1245,5 +1249,203 @@ export default function SettingsPage() {
         </Card>
       </PageSection>
     </div>
+  );
+}
+
+/**
+ * 手机同步（局域网）。
+ *
+ * 与 fewards 手机端配对后：手机把 WorkBuddy 凭据推过来，电脑刷新完把最新凭据回传，
+ * 手机下次同步自动取走。这里只管"开关 / 端口 / 配对码 / 待回传条数"，
+ * 真正的凭据收发在独立端口上（server/lansync/server.mjs），不经过控制台 UI。
+ */
+function LanSyncSection() {
+  const toast = useToast();
+  const confirm = useConfirm();
+  const [info, setInfo] = useState<LanSyncStatus | null>(null);
+  const [portDraft, setPortDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await get<LanSyncStatus>('/api/lansync/status');
+      setInfo(r);
+      setPortDraft(String(r.port));
+    } catch {
+      // 老版本服务端没有这个接口：静默降级，不打扰用户
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const apply = async (patch: { enabled?: boolean; port?: number; refreshOnPush?: boolean }) => {
+    setBusy(true);
+    try {
+      const r = await put<LanSyncStatus>('/api/lansync/settings', patch);
+      setInfo(r);
+      setPortDraft(String(r.port));
+      if (r.error) toast('err', `同步服务启动失败：${r.error}`);
+      else if (r.running) toast('ok', `已开启同步，正在监听 ${r.listeningPort} 端口`);
+      else toast('ok', '已关闭手机同步');
+    } catch (e) {
+      toast('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rotate = async () => {
+    const ok = await confirm({
+      title: '重置配对码',
+      message: <>重置后，已经配对的手机必须重新输入新配对码才能同步。确定继续吗？</>,
+      confirmText: '重置',
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const r = await post<LanSyncStatus>('/api/lansync/code/rotate');
+      setInfo(r);
+      toast('ok', '配对码已更新，请在手机上重新填写');
+    } catch (e) {
+      toast('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = (text: string, label: string) => {
+    if (!text) return;
+    navigator.clipboard?.writeText(text).then(
+      () => toast('ok', `已复制${label}`),
+      () => toast('err', '复制失败，请手动选中复制')
+    );
+  };
+
+  const clearQueue = async () => {
+    setBusy(true);
+    try {
+      const r = await post<LanSyncStatus>('/api/lansync/pending/clear');
+      setInfo(r);
+      toast('ok', '待回传队列已清空');
+    } catch (e) {
+      toast('err', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const shownPort = info?.listeningPort || info?.port;
+
+  return (
+    <PageSection
+      icon={<IconLayers />}
+      title="手机同步（局域网）"
+      desc="fewards 手机端把 WorkBuddy 凭据推送到这台电脑；电脑刷新凭据后，手机下次同步会自动取回最新值"
+      actions={
+        <Badge color={info?.running ? 'green' : info?.enabled ? 'amber' : 'gray'}>
+          {info?.running ? `监听中 :${info.listeningPort}` : info?.enabled ? '已开启但未运行' : '已关闭'}
+        </Badge>
+      }
+    >
+      <Card className="p-5">
+        <div className="divide-y divide-zinc-100 -mx-4">
+          <Row
+            label={
+              <span className="flex flex-wrap items-center gap-2">
+                启用手机同步
+                <Badge color={info?.enabled ? 'green' : 'gray'}>{info?.enabled ? '已开启' : '已关闭'}</Badge>
+              </span>
+            }
+            desc="会单独打开一个局域网端口，只暴露推送 / 拉取凭据的四个接口；控制台界面与反向代理仍然只监听 127.0.0.1。默认关闭。"
+          >
+            <label className="flex items-center gap-2 text-sm text-zinc-600 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={!!info?.enabled}
+                disabled={busy || loading}
+                onChange={(e) => apply({ enabled: e.target.checked })}
+                className="accent-indigo-600 rounded"
+              />
+              {info?.enabled ? '已开启' : '已关闭'}
+            </label>
+          </Row>
+
+          <Row label="监听端口" desc="手机端填这个端口。改完会自动重启监听，正在同步的手机会断开一次。">
+            <input
+              value={portDraft}
+              onChange={(e) => setPortDraft(e.target.value.replace(/\D/g, '').slice(0, 5))}
+              disabled={busy || loading}
+              className="w-24 rounded-lg border border-zinc-200 px-2.5 py-1.5 text-sm font-mono focus:border-indigo-400 focus:outline-none"
+              placeholder="57900"
+            />
+            <Button
+              size="sm"
+              variant="subtle"
+              disabled={busy || !portDraft || Number(portDraft) === info?.port}
+              onClick={() => apply({ port: Number(portDraft) })}
+            >
+              保存
+            </Button>
+          </Row>
+
+          <Row label="配对码" desc="手机端必须填同一串。重置后，所有已配对的手机都要重新输入。">
+            <code className="rounded-lg bg-zinc-100 px-3 py-1.5 font-mono text-base tracking-[0.18em] text-zinc-800">
+              {info?.pairCode || '未生成'}
+            </code>
+            <Button size="sm" variant="subtle" disabled={!info?.pairCode} onClick={() => copy(info?.pairCode || '', '配对码')}>
+              <IconCopy className="w-3.5 h-3.5" />
+              复制
+            </Button>
+            <Button size="sm" variant="subtle" loading={busy} onClick={rotate}>
+              重置
+            </Button>
+          </Row>
+
+          <Row label="手机该填的地址" desc="手机和电脑要在同一个 Wi-Fi 下（访客网络 / AP 隔离会连不通）。点一下复制。">
+            {info?.addresses?.length ? (
+              info.addresses.map((a) => (
+                <button
+                  key={a.address}
+                  type="button"
+                  onClick={() => copy(`${a.address}:${shownPort}`, '地址')}
+                  className="rounded-lg border border-zinc-200 px-2.5 py-1.5 font-mono text-xs text-zinc-700 hover:border-indigo-300 hover:text-indigo-600"
+                  title={`网卡 ${a.iface}，点一下复制`}
+                >
+                  {a.address}:{shownPort}
+                  <span className="ml-2 text-[10px] text-zinc-400">{a.iface}</span>
+                </button>
+              ))
+            ) : (
+              <span className="text-xs text-zinc-400">没有检测到局域网地址（电脑可能没连网络）</span>
+            )}
+          </Row>
+
+          <Row
+            label={
+              <span className="flex flex-wrap items-center gap-2">
+                待回传凭据
+                <Badge color={info?.pending?.count ? 'amber' : 'gray'}>{info?.pending?.count ?? 0}</Badge>
+              </span>
+            }
+            desc="电脑刷新过、手机还没取走的账号记录。手机每次同步会自动取走并确认，正常情况下这里会一直是 0。"
+          >
+            <Button size="sm" variant="subtle" disabled={busy || !info?.pending?.count} onClick={clearQueue}>
+              <IconTrash className="w-3.5 h-3.5" />
+              清空
+            </Button>
+          </Row>
+        </div>
+
+        <div className="mt-3 rounded-xl bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-700">
+          同一账号在任意时刻只应有一端刷新：手机刷新后立刻推送，电脑刷新后手机会自动取回。
+          两端各刷一次会让先刷的那份立即失效，表现为「账号突然要重新登录」。
+        </div>
+      </Card>
+    </PageSection>
   );
 }

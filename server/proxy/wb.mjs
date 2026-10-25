@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import { loadAccounts, saveAccounts, secretValue } from '../workbuddy/accounts.mjs';
 import { variantOf } from '../workbuddy/variant.mjs';
 import { syncTokensToAuthFile } from '../workbuddy/auth.mjs';
+import { notifyTokenRefreshed } from '../lansync/notify.mjs';
 
 /** 出站客户端版本段（对齐官方桌面端分发包，可调） */
 const CLIENT_VERSION = '5.5.4';
@@ -199,6 +200,20 @@ export async function refreshAccessToken(account, { timeoutMs = 30_000 } = {}) {
       syncTokensToAuthFile(target);
     } catch {
       /* 同步是尽力而为：账号库已更新，登录态文件下次切号时会重写 */
+    }
+    /**
+     * 手机同步：把刚刷出来的新凭据放进待回推队列。
+     *
+     * 这里是 b 侧**所有**刷新路径的唯一出口（代理临期、定时巡检、手动刷新、切号兜底），
+     * 所以挂在这一处就够，不必逐处打补丁。
+     *
+     * 失败不能影响刷新本身：凭据已经写盘，回推只是"顺便通知手机"，
+     * 手机下次主动同步时也能拿到最新值。
+     */
+    try {
+      notifyTokenRefreshed(target, { source: 'refresh' });
+    } catch {
+      /* 队列写失败不影响刷新结果 */
     }
   }
   return access;
