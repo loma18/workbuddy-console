@@ -30,7 +30,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { loadAccounts, saveAccounts, ACCOUNTS_FILE, BACKUP_DIR } from '../workbuddy/accounts.mjs';
-import { detectCurrentAccount } from '../workbuddy/auth.mjs';
+import { detectCurrentAccounts } from '../workbuddy/auth.mjs';
 import { refreshAccessToken } from '../proxy/wb.mjs';
 import {
   PROTOCOL_VERSION,
@@ -66,13 +66,19 @@ export function lanAddresses() {
   return out;
 }
 
-/** 当前登录账号的 uid（读不到登录态文件时为 null，不影响同步） */
-function currentUidSafe() {
+/**
+ * 当前登录账号的 uid 列表。
+ *
+ * 国内版 / 国际版各有一份登录态，可能同时各在用一个账号；只取一个会导致另一档
+ * 被当成普通账号覆盖掉，进而掉登录。
+ * 读不到登录态文件时返回空数组，不影响同步。
+ */
+function currentUidsSafe() {
   try {
-    const c = detectCurrentAccount();
-    return c?.account?.uid || c?.uid || null;
+    const all = detectCurrentAccounts();
+    return [all.cn.uid, all.ai.uid].filter(Boolean).map(String);
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -171,10 +177,10 @@ export async function startLanSync({ port, getPairCode, getRefreshOnPush, onLog 
     const mode = req.body?.mode === 'force' ? 'force' : 'merge';
     const device = String(req.body?.device?.name || 'android').slice(0, 40);
     const remotes = req.body.accounts.map(normalizeIncoming);
-    const currentUid = currentUidSafe();
+    const currentUids = currentUidsSafe();
     const locals = loadAccounts();
 
-    const { plans, summary } = planMerge({ remoteAccounts: remotes, localAccounts: locals, currentUid, mode });
+    const { plans, summary } = planMerge({ remoteAccounts: remotes, localAccounts: locals, currentUid: currentUids, mode });
 
     /* 1) 落库（只有 create / adopt 会真正写） */
     const next = locals.slice();
@@ -204,7 +210,7 @@ export async function startLanSync({ port, getPairCode, getRefreshOnPush, onLog 
         const uid = String(plan.remote.uid || plan.localId || '');
         const record = loadAccounts().find((a) => (uid && (a?.uid === uid || a?.id === uid)) || a?.id === plan.localId);
         if (!record) continue;
-        if (record.uid && currentUid && String(record.uid) === String(currentUid)) {
+        if (record.uid && currentUids.includes(String(record.uid))) {
           refreshNotes.set(uid, '电脑端正在使用该账号，已跳过刷新');
           continue;
         }
@@ -241,7 +247,7 @@ export async function startLanSync({ port, getPairCode, getRefreshOnPush, onLog 
         // 找不到记录（例如被 skipped-dead 丢掉）时 account 为 null，手机端跳过即可
         account: record
           ? serializeAccount(record, {
-              isCurrent: !!(currentUid && record.uid && String(currentUid) === String(record.uid)),
+              isCurrent: !!(record.uid && currentUids.includes(String(record.uid))),
               version: Number(record.syncVersion) || 0,
             })
           : null,

@@ -27,6 +27,7 @@
     "test:refresh": "node scripts/test-token-refresh.mjs",
     "test:lansync": "node scripts/test-lansync.mjs",
     "test:lansync:http": "node scripts/test-lansync-server.mjs",
+    "test:dual": "node scripts/test-dual-variant.mjs",
     "test:growth": "node scripts/test-growth.mjs",
     "test:app-update": "node scripts/test-app-update-event.mjs",
     "test:settings-event": "node scripts/test-settings-event.mjs",

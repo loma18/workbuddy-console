@@ -32,6 +32,7 @@ import { oauthStart, oauthPoll } from './workbuddy/oauth.mjs';
 import {
   switchAccount,
   detectCurrentAccount,
+  detectCurrentAccounts,
   importLocalAccount,
   deleteAccount,
   updateAccountDisplay,
@@ -573,6 +574,11 @@ app.get(
 app.get('/api/accounts', (req, res) => {
   const accounts = loadAccounts();
   const current = detectCurrentAccount();
+  /**
+   * 两个档位各有一份登录态文件，可以同时"各在用一个账号"。
+   * `current` 保留给老前端（单档位视图），`currents` 才是完整状态。
+   */
+  const currents = detectCurrentAccounts();
   // 附上最近一次验活结论：界面据此把「凭据有效」改成「服务端确认有效 / 已失效」，
   // 而不是只看本地有效期（2026-10-18 反馈：显示有效、切过去却登录过期）
   const verified = loadCredentialStatus();
@@ -585,6 +591,11 @@ app.get('/api/accounts', (req, res) => {
       authFilePath: current.authFilePath,
       account: current.account,
       warning: current.warning || null,
+    },
+    currents: {
+      cn: currents.cn,
+      ai: currents.ai,
+      active: currents.active,
     },
     variants: VARIANT_LIST.map((v) => ({ id: v.id, label: v.label, authFilePath: authFilePath(v.id), dataRoot: dataRoot(v.id) })),
   });

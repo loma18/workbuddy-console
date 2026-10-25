@@ -43,6 +43,17 @@ export const VARIANTS = {
 export const VARIANT_LIST = [VARIANTS.cn, VARIANTS.ai];
 
 export function getVariant(id) {
+  /**
+   * 兼容传对象：`variantOf()` 返回的是 VARIANT 对象而不是 id。
+   *
+   * 早期 `authFilePath(variant)` / `getVariant(variant)` 这类调用把对象直接传进来，
+   * `String(obj)` 得到 "[object Object]" → 查表失败 → **静默回落国内版**。
+   * 后果是切换国际版账号时写进了 `workbuddy-desktop.info`，把国内版的登录态覆盖掉，
+   * 表现为"两档没法分别切换"。这里把两种入参都接住，避免再出现同类问题。
+   */
+  if (id && typeof id === 'object') {
+    return VARIANTS[String(id.id || '')] || VARIANTS.cn;
+  }
   return VARIANTS[String(id || '')] || VARIANTS.cn;
 }
 

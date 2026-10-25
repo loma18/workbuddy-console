@@ -315,15 +315,31 @@ export interface OAuthPollResult {
   pollCount?: number;
 }
 
+/**
+ * 单个档位的登录态。
+ *
+ * 国内版与国际版各写一个文件（`workbuddy-desktop.info` / `workbuddy-desktop-ai.info`），
+ * 所以两档可以各自登录不同账号、互不影响。
+ */
+export interface CurrentAccountState {
+  variant: string;
+  variantLabel?: string;
+  exists: boolean;
+  uid: string | null;
+  authFilePath: string | null;
+  account: AccountInfo | null;
+  warning?: string | null;
+}
+
 export interface AccountsResponse {
   accounts: AccountInfo[];
-  current: {
-    variant: string;
-    uid: string | null;
-    exists: boolean;
-    authFilePath: string | null;
-    account: AccountInfo | null;
-    warning: string | null;
+  /** 单档位视图（兼容老前端）：取国内版优先的那个 */
+  current: CurrentAccountState;
+  /** 两档位各自的登录态；老版本服务端不返回该字段 */
+  currents?: {
+    cn: CurrentAccountState;
+    ai: CurrentAccountState;
+    active: string | null;
   };
   variants: VariantInfo[];
 }

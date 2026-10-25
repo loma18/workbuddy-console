@@ -1850,7 +1850,19 @@ export default function AccountsPage() {
   }
 
   const current = data?.current;
+  /**
+   * 两档位各自的登录态。老版本服务端没有 currents，退回单档位视图，
+   * 这样界面不会因为服务端没升级而空白。
+   */
+  const currents = data?.currents ?? {
+    cn: current,
+    ai: { ...current, exists: false, account: null, uid: null, authFilePath: null },
+    active: current?.variant ?? null,
+  };
   const accounts = data?.accounts || [];
+  /** 该账号是否是它所属档位的当前登录账号 */
+  const isCurrentAccount = (a: AccountInfo) =>
+    currents.cn?.account?.id === a.id || currents.ai?.account?.id === a.id;
 
   return (
     <div className="space-y-5">
@@ -1959,34 +1971,49 @@ export default function AccountsPage() {
             </Button>
           }
         />
-        <div className="mt-4 flex flex-wrap items-center gap-3">
-          {current?.exists && current.account ? (
-            <>
-              <Avatar name={current.account.name} seed={current.account.uid || current.account.id} />
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium text-zinc-900">{current.account.name}</span>
-                  <Badge color="green" dot>
-                    已登录
-                  </Badge>
-                  <Badge color="gray">{current.account.variantLabel}</Badge>
-                </div>
-                <div className="mt-1 text-xs text-zinc-400 font-mono truncate max-w-[520px]">{current.authFilePath}</div>
+        <div className="mt-4 space-y-4">
+          {([
+            ['cn', '国内版'],
+            ['ai', '国际版'],
+          ] as const).map(([vid, label]) => {
+            const c = currents[vid];
+            const loggedIn = !!c?.exists && !!c.account;
+            return (
+              <div key={vid} className="flex flex-wrap items-center gap-3">
+                {loggedIn ? (
+                  <>
+                    <Avatar name={c.account!.name} seed={c.account!.uid || c.account!.id} />
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-zinc-900">{c.account!.name}</span>
+                        <Badge color="green" dot>
+                          已登录
+                        </Badge>
+                        <Badge color="gray">{label}</Badge>
+                      </div>
+                      <div className="mt-1 text-xs text-zinc-400 font-mono truncate max-w-[520px]">{c.authFilePath}</div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-12 h-12 rounded-full bg-zinc-50 border border-zinc-200 text-zinc-400 flex items-center justify-center shrink-0">
+                      <IconUser className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-medium text-zinc-500">{label}：未登录</div>
+                      <div className="text-xs text-zinc-400 mt-0.5">
+                        {c?.uid
+                          ? `登录态中的账号（${c.uid.slice(0, 8)}…）尚未导入到账号库`
+                          : c?.authFilePath
+                            ? '该档位的登录态文件不存在'
+                            : 'WorkBuddy 登录态文件不存在或已损坏'}
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
-            </>
-          ) : (
-            <>
-              <div className="w-12 h-12 rounded-full bg-amber-50 border border-amber-200 text-amber-500 flex items-center justify-center shrink-0">
-                <IconWarning className="w-5 h-5" />
-              </div>
-              <div>
-                <div className="font-medium text-zinc-900">未检测到登录态</div>
-                <div className="text-xs text-zinc-400 mt-0.5">
-                  {current?.uid ? `登录态中的账号（${current.uid.slice(0, 8)}…）尚未导入到账号库` : 'WorkBuddy 登录态文件不存在或已损坏'}
-                </div>
-              </div>
-            </>
-          )}
+            );
+          })}
         </div>
         {current?.warning && (
           <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2 text-xs text-amber-800">
@@ -2033,7 +2060,7 @@ export default function AccountsPage() {
               <AccountCard
                 key={a.id}
                 account={a}
-                isCurrent={current?.account?.id === a.id}
+                isCurrent={isCurrentAccount(a)}
                 busy={busyId === a.id}
                 balance={balanceOf(a.id)}
                 balanceLoading={balanceLoading && !balanceOf(a.id)}

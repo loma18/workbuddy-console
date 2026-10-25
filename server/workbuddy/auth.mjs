@@ -126,7 +126,7 @@ export function buildAuthObject(account) {
  */
 export function syncTokensToAuthFile(account, { authPath: overridePath = null } = {}) {
   const variant = variantOf(account);
-  const authPath = overridePath || authFilePath(variant);
+  const authPath = overridePath || authFilePath(variant.id);
   let doc;
   try {
     if (!fs.existsSync(authPath)) return { synced: false, reason: 'no-auth-file' };
@@ -216,7 +216,7 @@ export function switchAccount(accountId) {
     );
   }
 
-  const authPath = authFilePath(variant);
+  const authPath = authFilePath(variant.id);
   fs.mkdirSync(path.dirname(authPath), { recursive: true });
 
   const accountObj = buildAccountObject(account);
@@ -270,7 +270,55 @@ export function switchAccount(accountId) {
 }
 
 /**
+ * 读取**单个档位**的当前登录账号。
+ *
+ * 两档位的登录态本来就是两个文件（`workbuddy-desktop.info` / `workbuddy-desktop-ai.info`），
+ * 所以"国内版在用 A、国际版在用 B"是完全合法的状态，必须能分别读出来。
+ */
+export function detectCurrentAccountForVariant(variantId) {
+  const variant = getVariant(variantId);
+  const authPath = authFilePath(variant.id);
+  const doc = readAuthFile(variant.id);
+  if (!doc) {
+    return { variant: variant.id, variantLabel: variant.label, exists: false, uid: null, account: null, authFilePath: authPath };
+  }
+  // 老版本登录态可能没有 account.uid，退回 sessionState
+  const uid = doc?.account?.uid || doc?.auth?.sessionState || null;
+  const record = uid ? loadAccounts().find((a) => a?.uid === uid) || null : null;
+  return {
+    variant: variant.id,
+    variantLabel: variant.label,
+    exists: true,
+    uid: uid ? String(uid) : null,
+    // 账号库里没有这条记录时 account 为 null，界面应提示"尚未导入"
+    account: record ? accountMeta(record) : null,
+    authFilePath: authPath,
+  };
+}
+
+/**
+ * 两个档位各自的当前账号。
+ *
+ * 返回 `{ cn, ai, active }`：
+ * - `cn` / `ai` 互不影响，可以各自是不同账号；
+ * - `active` 只表示"界面上默认展示哪一档"，国内版存在时优先（与历史行为一致）。
+ */
+export function detectCurrentAccounts() {
+  const cn = detectCurrentAccountForVariant('cn');
+  const ai = detectCurrentAccountForVariant('ai');
+  return { cn, ai, active: cn.exists ? 'cn' : ai.exists ? 'ai' : null };
+}
+
+/** 两个档位当前账号的 uid 集合（用于"不自动刷新当前账号"的判定） */
+export function currentUids() {
+  const all = detectCurrentAccounts();
+  return [all.cn.uid, all.ai.uid].filter(Boolean).map(String);
+}
+
+/**
  * 读取当前登录态对应的账号（用于在界面上标记"当前使用中"）。
+ *
+ * ⚠️ 这是**单档位视图**，已保留给老调用方；需要同时看两档请用 {@link detectCurrentAccounts}。
  * 登录态文件里的 uid 与账号库比对；比对不上说明该账号尚未导入。
  */
 export function detectCurrentAccount() {
@@ -292,13 +340,13 @@ export function detectCurrentAccount() {
   result.account = loadAccounts().find((a) => a?.uid === result.uid) || null;
   if (result.account) {
     result.account = accountMeta(result.account);
-    // 同时存在两份登录态时，提示当前读到的是哪个
+    // 同时存在两份登录态时，说明是"两档并行"，而不是谁覆盖了谁
     const bothVariants = ['cn', 'ai'].filter((v) => readAuthFile(v));
     if (bothVariants.length > 1) {
       const active = variantOf(result.account).id;
       result.variant = active;
       result.authFilePath = authFilePath(active);
-      result.warning = `国内版与国际版都存在登录态文件，当前账号（${active === 'cn' ? '国内版' : '国际版'}）优先`;
+      result.warning = `国内版与国际版各有一份登录态（当前显示${active === 'cn' ? '国内版' : '国际版'}），两档可分别切换、互不影响`;
     }
   }
   return result;
@@ -359,9 +407,15 @@ export function deleteAccount(accountId) {
   const accounts = loadAccounts();
   const target = accounts.find((a) => a?.id === accountId);
   if (!target) throw new Error('账号不存在');
-  const current = detectCurrentAccount();
-  if (current.account?.id === target.id) {
-    throw new Error('这是当前正在使用的账号，删除后 WorkBuddy 会失去登录态。请先切换到其他账号再删除');
+  /**
+   * 两档位各有一份登录态，所以"当前账号"可能有两个。
+   * 只检查其中一个会放过另一个——删掉之后那个档位的 WorkBuddy 直接掉登录。
+   */
+  const uids = currentUids();
+  if (target.uid && uids.includes(String(target.uid))) {
+    const all = detectCurrentAccounts();
+    const which = all.cn.uid === String(target.uid) ? '国内版' : '国际版';
+    throw new Error(`这是${which}当前正在使用的账号，删除后该档位会失去登录态。请先切换到其他账号再删除`);
   }
   saveAccounts(accounts.filter((a) => a?.id !== accountId));
   return { ok: true };

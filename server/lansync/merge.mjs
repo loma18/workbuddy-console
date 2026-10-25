@@ -80,6 +80,25 @@ function versionOf(record) {
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
 }
 
+/**
+ * "当前登录账号"归一化成 uid 集合。
+ *
+ * 国内版与国际版各有一份登录态，可能同时各在用一个账号，所以支持传数组；
+ * 也兼容老调用方传单个 uid。
+ */
+function toUidSet(currentUid) {
+  const set = new Set();
+  const add = (v) => {
+    if (v != null && String(v)) set.add(String(v));
+  };
+  if (Array.isArray(currentUid) || currentUid instanceof Set) {
+    for (const v of currentUid) add(v);
+  } else {
+    add(currentUid);
+  }
+  return set;
+}
+
 /** 本地账号是否有可用的明文 access_token（加密信封不算） */
 function plainAccessOf(record) {
   const t = record?.access_token;
@@ -147,7 +166,7 @@ export function matchLocal(remote, index) {
  *
  * @param {object}  remote       归一化后的入站账号（见 protocol.normalizeIncoming）
  * @param {object?} local        本地账号记录
- * @param {string?} currentUid   b 当前登录账号的 uid
+ * @param {string|string[]} currentUid b 当前登录账号的 uid（两档位可能各有一个，故支持数组）
  * @param {'merge'|'force'} mode merge=以新者为准（默认）；force=以手机为准
  * @param {number}  now
  */
@@ -188,13 +207,14 @@ export function decideFor({ remote, local, currentUid = null, mode = 'merge', no
   }
 
   // 2) 当前登录账号：任何情况下都不动（force 也不行）
+  //    两档位可能各有一个当前账号，所以 currentUid 允许传数组
   const localUid = String(local.uid || local.id || '').trim();
-  if (currentUid && localUid && String(currentUid) === localUid) {
+  if (localUid && toUidSet(currentUid).has(localUid)) {
     return {
       ...base,
       action: ACTIONS.SKIPPED_CURRENT,
       reason: 'current-account',
-      risk: '电脑端正在使用该账号，刷新或覆盖会导致 WorkBuddy 掉登录',
+      risk: '电脑端正在使用该账号，刷新或覆盖会导致该档位的 WorkBuddy 掉登录',
     };
   }
 

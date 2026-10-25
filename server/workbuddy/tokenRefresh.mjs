@@ -37,7 +37,7 @@ import {
   readJsonFile,
 } from './accounts.mjs';
 import { variantOf } from './variant.mjs';
-import { detectCurrentAccount } from './auth.mjs';
+import { detectCurrentAccounts } from './auth.mjs';
 import { verifyAccountCredential } from './credits.mjs';
 import { refreshAccessToken } from '../proxy/wb.mjs';
 import { atomicWriteJson } from '../store/config.mjs';
@@ -68,14 +68,34 @@ function plain(account, key) {
 }
 
 /**
+ * 把"当前账号"参数归一化成 uid 集合。
+ *
+ * 国内版与国际版各有一份登录态，可能同时是"当前账号"，所以要支持多个 uid。
+ * 同时兼容老调用方传单个 `currentUid`（测试与外部模块还在用）。
+ */
+function uidSetOf(currentUid, currentUids) {
+  const set = new Set();
+  const add = (v) => {
+    if (v != null && String(v)) set.add(String(v));
+  };
+  add(currentUid);
+  for (const v of Array.isArray(currentUids) ? currentUids : currentUids != null ? [currentUids] : []) add(v);
+  return set;
+}
+
+/**
  * 单个账号的刷新判定。纯函数，便于回归测试直接喂时间戳。
  * 返回 { id, name, variant, accessHours, refreshHours, hasRefreshToken, dead, due, reason }
  */
-export function refreshPlanFor(account, { now = Date.now(), force = false, currentUid = null } = {}) {
+export function refreshPlanFor(
+  account,
+  { now = Date.now(), force = false, currentUid = null, currentUids = null } = {}
+) {
   const accessHours = hoursLeft(account?.expiresAt, now);
   const refreshHours = hoursLeft(account?.refreshExpiresAt, now);
   const hasRefreshToken = !!plain(account, 'refresh_token');
   const hasAccess = !!plain(account, 'access_token');
+  const currentSet = uidSetOf(currentUid, currentUids);
 
   const base = {
     id: account?.id || '',
@@ -87,7 +107,7 @@ export function refreshPlanFor(account, { now = Date.now(), force = false, curre
     hasRefreshToken,
     hasPlainAccess: hasAccess,
     /** 该账号是否就是 WorkBuddy 当前登录账号（登录态由官方客户端自己维护） */
-    current: !!(currentUid && account?.uid && String(account.uid) === String(currentUid)),
+    current: !!(account?.uid && currentSet.has(String(account.uid))),
     dead: false,
     due: false,
     reason: 'ok',
@@ -129,11 +149,12 @@ export function refreshPlanFor(account, { now = Date.now(), force = false, curre
 
 /** 全部账号的判定结果（界面用；不含 token）。带上当前登录账号标记与最近一次验活结论 */
 export function refreshPlan({ now = Date.now() } = {}) {
-  const current = detectCurrentAccount();
-  const currentUid = current?.account?.uid || current?.uid || null;
+  // 两档位各有一份登录态：两个当前账号都要保护，只取一个会顶掉另一档
+  const currents = detectCurrentAccounts();
+  const currentUids = [currents.cn.uid, currents.ai.uid].filter(Boolean);
   const status = loadCredentialStatus();
   return loadAccounts().map((a) => {
-    const plan = refreshPlanFor(a, { now, currentUid });
+    const plan = refreshPlanFor(a, { now, currentUids });
     return { ...plan, verify: status[plan.id] || null };
   });
 }
@@ -326,13 +347,14 @@ export function decideCredentialAction({ plan, verify = null, force = false } = 
 export async function refreshAccounts({ accountIds = null, force = false, delayMs = 400, skipVerify = false } = {}) {
   const wanted = Array.isArray(accountIds) && accountIds.length ? new Set(accountIds) : null;
   const targets = loadAccounts().filter((a) => !wanted || wanted.has(a?.id) || wanted.has(a?.uid));
-  // 当前登录账号的登录态由 WorkBuddy 自己维护，自动刷新必须绕开它（见 refreshPlanFor 注释）
-  const current = detectCurrentAccount();
-  const currentUid = current?.account?.uid || current?.uid || null;
+  // 当前登录账号的登录态由 WorkBuddy 自己维护，自动刷新必须绕开它（见 refreshPlanFor 注释）。
+  // 两档位各有一份登录态，所以是"两个当前账号"，只保护一个会顶掉另一档。
+  const currents = detectCurrentAccounts();
+  const currentUids = [currents.cn.uid, currents.ai.uid].filter(Boolean);
 
   const results = [];
   for (const account of targets) {
-    const plan = refreshPlanFor(account, { force, currentUid });
+    const plan = refreshPlanFor(account, { force, currentUids });
 
     // 1) 验活（加密信封账号没有明文凭据，发不出带鉴权的请求，只能跳过）
     let verify = null;
@@ -391,7 +413,7 @@ export async function refreshAccounts({ accountIds = null, force = false, delayM
       await refreshAccessToken(account);
       // 重新读盘拿刷新后的有效期（refreshAccessToken 已原子写回）
       const after = loadAccounts().find((a) => a?.id === account.id || a?.uid === account.uid) || account;
-      const next = refreshPlanFor(after, { now: Date.now(), currentUid });
+      const next = refreshPlanFor(after, { now: Date.now(), currentUids });
       // 刷新成功即视为服务端认可（refresh 端点本身就是一次带凭据的调用），更新验活结论
       const verifyAfter = skipVerify ? verify : { at: Date.now(), valid: true, unauthorized: false, message: '' };
       if (verifyAfter) recordVerify(plan.id || account?.id || '', verifyAfter);
