@@ -288,14 +288,20 @@ function AccountCard({
           ? { color: 'green', text: '凭据有效' }
           : { color: 'gray', text: '待验活' };
 
-  const credTitle = vs?.unauthorized
-    ? `服务端于 ${fmtClock(vs.at)} 明确拒绝该凭据（token 已被轮换或吊销）。请重新登录该账号后重新导入`
-    : vs?.valid
-      ? `服务端于 ${fmtClock(vs.at)} 确认凭据有效`
-      : authInvalid
-        ? '官方接口已拒绝这个账号的凭据，本地「未过期」不算数。请重新登录该账号后重新导入'
-        : !account.hasPlainToken
-          ? undefined
+  /**
+   * 没有明文凭据时，标题只解释"为什么不能验活"，不能被历史验活/余额结果带偏：
+   * 加密信封账号曾经因为发了空 Bearer 拿到 401，被误记成"凭据已失效"。
+   */
+  const credTitle = !account.hasPlainToken
+    ? account.hasEnvelope
+      ? '该档位的登录态是客户端加密信封（取不出明文）：可用于切换账号，但无法验活、刷新或查询余额。需要余额/积分请改用「扫码添加账号」重新授权'
+      : '该账号没有保存任何可用凭据：如果 WorkBuddy 当前正登录着它，请点上方「导入」重新导入；否则请用「扫码添加账号」'
+    : vs?.unauthorized
+      ? `服务端于 ${fmtClock(vs.at)} 明确拒绝该凭据（token 已被轮换或吊销）。请重新登录该账号后重新导入`
+      : vs?.valid
+        ? `服务端于 ${fmtClock(vs.at)} 确认凭据有效`
+        : authInvalid
+          ? '官方接口已拒绝这个账号的凭据，本地「未过期」不算数。请重新登录该账号后重新导入'
           : '尚未验活：凭据巡检每 6 小时自动验一次，也可以点「刷新凭据」立即验证';
 
   const pkgs = usablePackages(balance).slice(0, 2);
@@ -381,7 +387,9 @@ function AccountCard({
                   ? `共 ${fmtCredits(balance.total)}，已用 ${fmtCredits(balance.used)}`
                   : account.hasPlainToken
                     ? '余额查询失败'
-                    : '该账号无可用凭据，无法查询余额'
+                    : account.hasEnvelope
+                      ? '该账号凭据是加密信封（取不出明文），无法查询余额'
+                      : '该账号无可用凭据，无法查询余额'
             }
           >
             {balanceLoading ? <Spinner className="w-3.5 h-3.5" /> : <IconClock className="w-3.5 h-3.5 shrink-0" />}
@@ -413,7 +421,15 @@ function AccountCard({
             </>
           ) : !balance ? (
             <>
-              <StatusPackageRow text={account.hasPlainToken ? '余额暂不可用' : '无可用凭据，无法查询余额'} />
+              <StatusPackageRow
+                text={
+                  account.hasPlainToken
+                    ? '余额暂不可用'
+                    : account.hasEnvelope
+                      ? '加密凭据，无法查询余额'
+                      : '无可用凭据，无法查询余额'
+                }
+              />
               <CreditPackageRow />
             </>
           ) : pkgTotal === 0 ? (
@@ -432,9 +448,15 @@ function AccountCard({
           variant={isCurrent ? 'subtle' : 'primary'}
           size="sm"
           className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
-          disabled={isCurrent || busy || !account.hasPlainToken}
+          disabled={isCurrent || busy || (!account.hasPlainToken && !account.hasEnvelope)}
           onClick={onSwitch}
-          title={account.hasPlainToken ? '把 WorkBuddy 的登录态切换到这个账号' : '该账号没有可用的明文凭据，无法切换'}
+          title={
+            account.hasPlainToken
+              ? `把 ${appLabelOf(account.variant)} 的登录态切换到这个账号（只重启该档位客户端）`
+              : account.hasEnvelope
+                ? '该账号凭据是加密信封：切换时原样写回登录态文件即可生效（但无法查余额/刷新）'
+                : '该账号没有可用的凭据，无法切换'
+          }
         >
           {isCurrent ? <IconCheck className="w-3.5 h-3.5" /> : <IconSwitch className="w-3.5 h-3.5" />}
           {isCurrent ? '使用中' : '切换账号'}
@@ -465,7 +487,9 @@ function AccountCard({
           title={
             account.hasPlainToken
               ? '用 refresh_token 换一份新的 access_token，有效期顺延（账号长期不用时可防止静默失效）'
-              : '该账号没有可用的凭据，需重新扫码登录'
+              : account.hasEnvelope
+                ? '加密凭据取不出明文 refresh_token，无法在本机续期；请用「扫码添加账号」重新授权'
+                : '该账号没有可用的凭据，需重新扫码登录'
           }
         >
           <IconRefresh className="w-3.5 h-3.5" />
@@ -1278,20 +1302,33 @@ function fmtBytes(n: number): string {
 const SESSION_RENDER_LIMIT = 200;
 
 /**
- * 「自动退出 WorkBuddy」勾选行（受控纯展示，两处复用）。
+ * 两档客户端的显示名。
  *
- * 勾上后：切换/复制前由服务端结束 WorkBuddy 的全部相关进程，确认退出后才动数据；
+ * 国内版与国际版是**两个独立安装的客户端**（`WorkBuddy` / `WorkBuddy AI`），
+ * 切号只会重启目标账号所属的那一个。所有"退出 / 重新打开 / 正在运行"的文案
+ * 都必须说对名字，否则用户会去关错程序（说"退出 WorkBuddy"、实际要关的是国际版）。
+ */
+const APP_LABEL: Record<'cn' | 'ai', string> = { cn: 'WorkBuddy', ai: 'WorkBuddy AI' };
+
+const appLabelOf = (variant?: string | null) => APP_LABEL[variant === 'ai' ? 'ai' : 'cn'];
+
+/**
+ * 「自动退出 xxx」勾选行（受控纯展示，两处复用）。
+ *
+ * 勾上后：切换/复制前由服务端结束**该档位客户端**的全部相关进程，确认退出后才动数据；
  * 切换完成后再把它重新打开（只重开"确实是我们关掉的"那种情况）。
  */
 function StopAppRow({
   checked,
   onChange,
   disabled,
+  appLabel = 'WorkBuddy',
   children,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
+  appLabel?: string;
   children?: React.ReactNode;
 }) {
   return (
@@ -1308,7 +1345,7 @@ function StopAppRow({
         onChange={(e) => onChange(e.target.checked)}
       />
       <span className="text-xs leading-relaxed text-indigo-900">
-        <b>自动退出 WorkBuddy</b>：由本工具结束后台的全部 WorkBuddy 进程，确认退出后才执行，不再需要你手动关闭。
+        <b>自动退出 {appLabel}</b>：由本工具结束后台的全部 {appLabel} 进程，确认退出后才执行，不再需要你手动关闭。
         {children}
       </span>
     </label>
@@ -1321,11 +1358,12 @@ function StopAppRow({
  * 必须这样做：确认弹窗保存的是**调用那一刻的消息节点快照**，
  * 由父组件受控的 checkbox 不会跟着父组件重渲染，勾了也读不到。
  */
-function StopAppToggleRef({ flagRef }: { flagRef: { current: boolean } }) {
+function StopAppToggleRef({ flagRef, appLabel = 'WorkBuddy' }: { flagRef: { current: boolean }; appLabel?: string }) {
   const [on, setOn] = useState(true);
   return (
     <StopAppRow
       checked={on}
+      appLabel={appLabel}
       onChange={(v) => {
         setOn(v);
         flagRef.current = v;
@@ -1380,12 +1418,14 @@ function SessionCopyDialog({
   onDone: () => void;
 }) {
   const toast = useToast();
+  /** 目标账号所属档位的客户端名：复制前要退出的就是它（另一档不该被动到） */
+  const appLabel = appLabelOf(target?.variant);
   const [data, setData] = useState<SessionListResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [query, setQuery] = useState('');
   const [hideCopied, setHideCopied] = useState(true);
-  /** 默认勾选：由服务端直接结束 WorkBuddy 进程，用户不必自己动手 */
+  /** 默认勾选：由服务端直接结束该档位客户端进程，用户不必自己动手 */
   const [stopApp, setStopApp] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -1468,7 +1508,7 @@ function SessionCopyDialog({
         const rep = r?.sessionCopy || null;
         const failed = rep?.errors?.length || 0;
         const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
-        const tail = reopenFailed ? 'WorkBuddy 已退出但重新打开失败，请手动打开' : 'WorkBuddy 已自动重新打开';
+        const tail = reopenFailed ? `${appLabel} 已退出但重新打开失败，请手动打开` : `${appLabel} 已自动重新打开`;
         toast(
           failed || reopenFailed ? 'err' : 'ok',
           `已复制 ${rep?.copied.length || 0} 个会话并切换到「${target.name}」` +
@@ -1495,8 +1535,8 @@ function SessionCopyDialog({
       const reopenFailed = rep.relaunch ? rep.relaunch.launched === false : false;
       const procNote = rep.appStop?.wasRunning
         ? reopenFailed
-          ? '；WorkBuddy 已退出，但重新打开失败，请手动打开'
-          : '；WorkBuddy 已自动重新打开'
+          ? `；${appLabel} 已退出，但重新打开失败，请手动打开`
+          : `；${appLabel} 已自动重新打开`
         : '';
       if (rep.ok && !reopenFailed) toast('ok', `已复制 ${rep.copied.length} 个会话到「${target.name}」${procNote}`);
       else
@@ -1544,8 +1584,8 @@ function SessionCopyDialog({
             onClick={run}
             title={
               blocked
-                ? 'WorkBuddy 正在运行：请勾选「自动退出 WorkBuddy」或自己先退出'
-                : `${selected.size} 个会话${wbRunning && stopApp ? '（会先自动退出 WorkBuddy）' : ''}`
+                ? `${appLabel} 正在运行：请勾选「自动退出 ${appLabel}」或自己先退出`
+                : `${selected.size} 个会话${wbRunning && stopApp ? `（会先自动退出 ${appLabel}）` : ''}`
             }
           >
             <IconCopy className="w-3.5 h-3.5" />
@@ -1565,20 +1605,20 @@ function SessionCopyDialog({
           <span>
             {blocked ? (
               <>
-                <b>WorkBuddy 正在运行，无法复制。</b>运行中的实例看不到写入，继续对话会让副本与源会话分叉。
-                勾选下面的「自动退出 WorkBuddy」，或自己先完全退出后重试。
+                <b>{appLabel} 正在运行，无法复制。</b>运行中的实例看不到写入，继续对话会让副本与源会话分叉。
+                勾选下面的「自动退出 {appLabel}」，或自己先完全退出后重试。
               </>
             ) : (
               <>
-                复制前的写入要求 WorkBuddy 不在运行
+                复制前的写入要求 {appLabel} 不在运行
                 {wbRunning && stopApp ? '——下面已勾选自动退出，由本工具结束后台进程并确认退出' : ''}。
-                复制出的会话是独立副本，WorkBuddy 下次启动时会把它们<b>上传到云端</b>，会占用云端空间与流量。
+                复制出的会话是独立副本，{appLabel} 下次启动时会把它们<b>上传到云端</b>，会占用云端空间与流量。
               </>
             )}
           </span>
         </div>
 
-        {wbRunning && <StopAppRow checked={stopApp} onChange={setStopApp} />}
+        {wbRunning && <StopAppRow checked={stopApp} onChange={setStopApp} appLabel={appLabel} />}
 
         {loading && (
           <div className="flex items-center gap-2 py-10 text-sm text-zinc-400">
@@ -1823,10 +1863,33 @@ export default function AccountsPage() {
     }
   }, [loadBalances]);
 
+  /**
+   * 当前查看的档位（给 15 秒轮询的闭包用）。
+   * 直接用 `variant` 会让 interval 每次都重建，这里用 ref 跟随最新值。
+   */
+  const variantRef = useRef<'cn' | 'ai'>(variant);
+  useEffect(() => {
+    variantRef.current = variant;
+  }, [variant]);
+
+  /**
+   * 探测**当前档位**的客户端是否在运行。
+   *
+   * 两档是两个独立客户端，切号也只重启自己那一档，所以运行状态必须分开问：
+   * 看国际版账号时该关心的是 `WorkBuddy AI` 有没有在跑，国内版在不在跑与这次切换无关。
+   */
+  const loadWb = useCallback(async () => {
+    try {
+      const i = await get<LoadedInfo>(`/api/workbuddy/status?variant=${variantRef.current}`);
+      setWbRunning(!!i?.running);
+    } catch {
+      /* 探测失败保持上一次结论，不清空状态 */
+    }
+  }, []);
+
   useEffect(() => {
     load();
     void loadBalances();
-    const loadWb = () => get<LoadedInfo>('/api/workbuddy/status').then((i) => setWbRunning(!!i?.running)).catch(() => {});
     loadWb();
     // 15 秒一次静默刷新：手机端推送新账号后不必手动刷新页面（本机 JSON，开销可忽略）
     const t = setInterval(() => {
@@ -1834,7 +1897,12 @@ export default function AccountsPage() {
       loadWb();
     }, 15_000);
     return () => clearInterval(t);
-  }, [load, loadBalances, loadQuiet]);
+  }, [load, loadBalances, loadQuiet, loadWb]);
+
+  // 切档位后立刻重新探测：否则会拿另一档的运行状态提醒用户去关一个没在跑的程序
+  useEffect(() => {
+    loadWb();
+  }, [variant, loadWb]);
 
   // 首次拿到数据后，档位默认跟着当前登录态走
   useEffect(() => {
@@ -1876,8 +1944,14 @@ export default function AccountsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** 切换账号的收尾：写登录态文件（可先自动退出 WorkBuddy、再复制会话） */
+  /**
+   * 切换账号的收尾：写登录态文件（可先自动退出该档位客户端、再复制会话）。
+   *
+   * 文案里的客户端名取自**目标账号所属档位**：切国际版账号时重启的是 WorkBuddy AI，
+   * 国内版客户端全程不被动到。
+   */
   const switchNow = async (account: AccountInfo, copySessionIds: string[] = [], stopApp = true) => {
+    const label = appLabelOf(account.variant);
     setBusyId(account.id);
     try {
       const r = await post<SwitchAccountResult>(
@@ -1893,10 +1967,10 @@ export default function AccountsPage() {
       const wasStopped = !!r?.appStop?.wasRunning;
       const reopenFailed = r?.relaunch ? r.relaunch.launched === false : false;
       const tail = reopenFailed
-        ? 'WorkBuddy 已退出但重新打开失败，请手动打开'
+        ? `${label} 已退出但重新打开失败，请手动打开`
         : wasStopped
-          ? 'WorkBuddy 已自动重新打开'
-          : '请重新打开 WorkBuddy';
+          ? `${label} 已自动重新打开`
+          : `请重新打开 ${label}`;
       toast(
         reopenFailed ? 'err' : 'ok',
         `已切换到「${account.name}」${copied ? `，并复制了 ${copied} 个会话` : ''}，${tail}`
@@ -1904,6 +1978,8 @@ export default function AccountsPage() {
       if (r?.backupPath) console.info('登录态备份：', r.backupPath);
       setSessionTarget(null);
       load();
+      // 被关掉又重开的那一档，运行状态可能变了，立刻重新探测一次
+      loadWb();
     } catch (e: any) {
       toast('err', e?.message || '切换失败');
     } finally {
@@ -1914,20 +1990,24 @@ export default function AccountsPage() {
   const doSwitch = async (account: AccountInfo) => {
     copyOnSwitchRef.current = false;
     stopAppRef.current = true;
+    const label = appLabelOf(account.variant);
     const ok = await confirm({
       title: '切换账号',
       message: (
         <>
-          将把账号「<b>{account.name}</b>」写入 WorkBuddy 登录态文件。
+          将把账号「<b>{account.name}</b>」写入 <b>{label}</b> 的登录态文件。
           <div className="mt-2.5 text-xs text-zinc-500 leading-relaxed">
             切换前会自动备份当前登录态（~/.wb-switch/backups/）。
+            {account.variant === 'ai'
+              ? '另一档（国内版 WorkBuddy）的登录态与进程都不受影响。'
+              : '另一档（国际版 WorkBuddy AI）的登录态与进程都不受影响。'}
           </div>
-          <StopAppToggleRef flagRef={stopAppRef} />
+          <StopAppToggleRef flagRef={stopAppRef} appLabel={label} />
           <CopyOnSwitchToggle flagRef={copyOnSwitchRef} />
           <div className="mt-2 flex items-start gap-1.5 text-xs leading-relaxed text-zinc-400">
             <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-400" />
             <span>
-              取消勾选「自动退出」就必须自己先完全退出 WorkBuddy；否则它会把登录态改写回去，切换不生效。
+              取消勾选「自动退出」就必须自己先完全退出 {label}；否则它会把登录态改写回去，切换不生效。
             </span>
           </div>
         </>
@@ -1975,16 +2055,21 @@ export default function AccountsPage() {
     }
   };
 
-/** 一键结束后台全部 WorkBuddy 进程（与切换/复制里的自动退出同一条服务端逻辑） */
+  /**
+   * 一键结束后台进程（与切换/复制里的自动退出同一条服务端逻辑）。
+   *
+   * 只退**当前查看档位**的客户端：另一档可能在正常使用，这里顺手关掉它没有任何好处。
+   */
   const stopNow = async () => {
+    const label = appLabelOf(variant);
     const ok = await confirm({
-      title: '退出 WorkBuddy',
+      title: `退出 ${label}`,
       message: (
         <>
-          将结束后台<b>全部</b> WorkBuddy 相关进程，并确认它们真的退出。
+          将结束后台<b>全部</b> {label} 相关进程，并确认它们真的退出。
           <div className="mt-2.5 text-xs leading-relaxed text-zinc-500">
             正在进行的对话会<b className="text-red-600">立即中断</b>；关闭前未落盘的内容可能丢失。
-            切换账号时勾选「自动退出 WorkBuddy」会自动完成这一步，并在切换后重新打开它。
+            切换账号时勾选「自动退出 {label}」会自动完成这一步，并在切换后重新打开它。
           </div>
         </>
       ),
@@ -1994,15 +2079,15 @@ export default function AccountsPage() {
     if (!ok) return;
     setStopping(true);
     try {
-      const r = await post<AppStopResult>('/api/workbuddy/stop');
+      const r = await post<AppStopResult>('/api/workbuddy/stop', { variant });
       if (r?.wasRunning) {
-        toast('ok', `已退出 WorkBuddy（结束 ${r.killed.length} 个进程${r.forced ? '，强制结束' : ''}）`);
+        toast('ok', `已退出 ${label}（结束 ${r.killed.length} 个进程${r.forced ? '，强制结束' : ''}）`);
       } else {
-        toast('ok', 'WorkBuddy 本来就没有在运行');
+        toast('ok', `${label} 本来就没有在运行`);
       }
       setWbRunning(false);
     } catch (e: any) {
-      toast('err', e?.message || '退出 WorkBuddy 失败');
+      toast('err', e?.message || `退出 ${label} 失败`);
     } finally {
       setStopping(false);
     }
@@ -2037,7 +2122,15 @@ export default function AccountsPage() {
     setImporting(v.id);
     try {
       const acc = await post<AccountInfo>('/api/accounts/import', { variant: v.id });
-      toast('ok', `已导入「${acc.name}」`);
+      // 加密信封：能切号，但取不出明文 → 余额/积分/签到都发不出去，必须当场说清楚
+      if (acc.hasEnvelope) {
+        toast(
+          'info',
+          `已导入「${acc.name}」：该档位登录态是加密凭据，可用于切换账号，但查不了余额/积分。需要余额数据请改用「扫码添加账号」重新授权`
+        );
+      } else {
+        toast('ok', `已导入「${acc.name}」`);
+      }
       load();
       void loadBalances(true);
     } catch (e: any) {
@@ -2063,6 +2156,8 @@ export default function AccountsPage() {
     [data, variant]
   );
   const activeVariant = (data?.variants || []).find((v) => v.id === variant);
+  /** 当前档位的客户端名：运行状态、退出按钮、切换确认都按它说话 */
+  const appLabel = appLabelOf(variant);
 
   const stats = useMemo(() => {
     const list = data?.accounts || [];
@@ -2112,18 +2207,18 @@ export default function AccountsPage() {
           ]}
         />
         <span className="text-xs text-zinc-400 leading-relaxed">
-          两套登录态互相独立，账号库与 workbuddy-switch 共用同一份文件
+          两套登录态、两个客户端互相独立：切哪一档就只重启哪一档
         </span>
         <div className="ml-auto flex items-center gap-1.5">
           {wbRunning ? (
             <Badge color="green" dot>
               <IconPower className="w-3 h-3" />
-              WorkBuddy 运行中
+              {appLabel} 运行中
             </Badge>
           ) : (
             <Badge color="gray" dot>
               <IconPower className="w-3 h-3" />
-              WorkBuddy 未运行
+              {appLabel} 未运行
             </Badge>
           )}
         </div>
@@ -2172,17 +2267,17 @@ export default function AccountsPage() {
         </div>
       </div>
 
-      {/* 运行中提醒：WorkBuddy 会把登录态改写回去，这是切换不生效的主因 */}
+      {/* 运行中提醒：客户端会把登录态改写回去，这是切换不生效的主因 */}
       {wbRunning && (
         <div className="flex flex-wrap items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 leading-relaxed">
           <IconWarning className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500" />
           <span className="min-w-[220px] flex-1">
-            <b>WorkBuddy 正在运行。</b>此时切换账号会被它改写回原账号。切换 / 复制时勾选
-            「自动退出 WorkBuddy」即可由本工具直接结束后台进程，不需要你手动关闭。
+            <b>{appLabel} 正在运行。</b>此时切换账号会被它改写回原账号。切换 / 复制时勾选
+            「自动退出 {appLabel}」即可由本工具直接结束后台进程，不需要你手动关闭。
           </span>
           <Button size="sm" variant="danger" className="shrink-0" loading={stopping} onClick={stopNow}>
             <IconPower className="w-3.5 h-3.5" />
-            退出 WorkBuddy
+            退出 {appLabel}
           </Button>
         </div>
       )}
@@ -2192,7 +2287,7 @@ export default function AccountsPage() {
         <SectionHeader
           icon={<IconUsers />}
           title="当前登录态"
-          desc="切换账号会重写 WorkBuddy 的登录态文件，操作前自动备份，失败自动回滚"
+          desc="切换账号会重写该档位客户端的登录态文件，操作前自动备份，失败自动回滚"
           actions={
             <Button
               size="sm"
@@ -2286,7 +2381,7 @@ export default function AccountsPage() {
             </div>
             <p className="text-sm text-zinc-500">暂无{variant === 'ai' ? '国际版' : '国内版'}账号。</p>
             <p className="mt-2 text-xs leading-5 text-zinc-400">
-              先用 WorkBuddy 登录一个账号，再点上方「导入{variant === 'ai' ? '国际版' : '国内版'}」加入账号库，之后就能在这里一键切换。
+              先用 {appLabel} 登录一个账号，再点上方「导入{variant === 'ai' ? '国际版' : '国内版'}」加入账号库，之后就能在这里一键切换。
             </p>
           </div>
         ) : (

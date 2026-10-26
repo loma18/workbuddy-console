@@ -4,6 +4,7 @@ import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { loadConfig } from '../store/config.mjs';
 import { matchPlatformUrl } from '../providers/registry.mjs';
+import { appLabelOf, getVariant, processNamesFor } from '../workbuddy/variant.mjs';
 
 /** 检查目录是否具备 WorkBuddy 数据目录的特征文件 */
 function inspectDir(dir) {
@@ -231,17 +232,32 @@ function shortExecError(err) {
 }
 
 /**
- * WorkBuddy 桌面端的进程名（PowerShell 的 `-Name` 与 tasklist 的 `IMAGENAME` 都用它）。
+ * 进程名的默认值 = **国内版**（`WorkBuddy` / 旧名 `CodeBuddy`）。
  *
- * 探测与结束进程的函数都接受 `names` 覆盖它——**只为自动化测试**：
- * 测试机上真实 WorkBuddy 多半正在运行，用同名替身进程才能真实验证
- * 「优雅退出 → 强杀 → 确认消失」这条升级逻辑，而不必关掉真的客户端。
+ * 为什么不默认"两档都算"：`models.json`、`~/.workbuddy` 数据目录、模型载入后的
+ * "待重启"判定全都是国内版的事，默认值必须保持历史语义。国际版要显式传
+ * `{ variant: 'ai' }`（进程名 `WorkBuddyAI`）——两档是两个独立客户端，
+ * 切号时只该动自己那一档。
  *
  * ⚠️ 千万别改成通配符（`WorkBuddy*`）：两者的匹配都是**按映像名精确**的，而控制台自己打包后的
  * 进程叫 `WorkBuddy Console`（electron-builder 的 productName）。一旦放宽成前缀匹配，
  * 切号时就会**把控制台自己杀掉**，切换动作当场中断。
+ * （同理 `WorkBuddy` 也**不会**匹配到 `WorkBuddyAI`：PowerShell 的 `-Name` 不带通配符时是精确匹配，
+ * tasklist 的 `IMAGENAME eq` 同样是精确比较，实测两档进程各自独立。）
  */
-export const WORKBUDDY_PROCESS_NAMES = ['WorkBuddy', 'CodeBuddy'];
+export const WORKBUDDY_PROCESS_NAMES = getVariant('cn').processNames;
+
+/**
+ * 解析"这次要动哪些进程名"。
+ *
+ * 优先级：显式 `names`（自动化测试用） > `variant`（'cn' / 'ai' / 'all'） > 默认国内版。
+ */
+function resolveNames({ names, variant } = {}) {
+  if (Array.isArray(names) && names.length) return names;
+  if (variant) return processNamesFor(variant);
+  return WORKBUDDY_PROCESS_NAMES;
+}
+
 
 /** 解析 PowerShell 序列化的启动时间：PS 5.1 为 "/Date(ms)/"，PS 7 为 ISO 字符串 */
 function parseStartTime(v) {
@@ -446,7 +462,8 @@ async function listViaPs(names = WORKBUDDY_PROCESS_NAMES) {
   return selectWorkbuddyRows(parsePsProcessTable(stdout), names);
 }
 
-export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
+export async function detectWorkbuddyProcess({ names, variant } = {}) {
+  const procs = resolveNames({ names, variant });
   const platform = process.platform;
 
   if (platform === 'win32') {
@@ -454,7 +471,7 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
     let probed = false; // 是否至少有一种方式成功执行完
 
     try {
-      const r = await detectViaPowerShell(names);
+      const r = await detectViaPowerShell(procs);
       probed = true;
       if (r) return r;
     } catch (err) {
@@ -463,7 +480,7 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
       failures.push(`PowerShell 探测失败（${shortExecError(err)}）`);
     }
     try {
-      const r = await detectViaTasklist(names);
+      const r = await detectViaTasklist(procs);
       probed = true;
       if (r) return r;
     } catch (err) {
@@ -488,7 +505,7 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
   }
 
   // macOS / Linux：走 ps 全量进程表（pgrep 的自杀陷阱见 listViaPs 注释）
-  const { processes, method, error } = await listWorkbuddyProcesses({ names });
+  const { processes, method, error } = await listWorkbuddyProcesses({ names: procs });
   if (error) return { running: false, error, platform };
   if (!processes.length) return { running: false, platform, method };
   // 列表已按启动时间升序（ps 路径），第一个 = 主进程 = 应用真正启动的时刻
@@ -505,14 +522,27 @@ export async function detectWorkbuddyProcess({ names = WORKBUDDY_PROCESS_NAMES }
   };
 }
 
-/** 定位 WorkBuddy 可执行文件：优先检测到的真实路径，再按常见安装位置兜底 */
-function findWorkbuddyExe(detectedPath) {
+/**
+ * 定位**指定档位**的可执行文件：优先检测到的真实路径，再按常见安装位置兜底。
+ *
+ * 检测到的路径只在文件名属于本档位时才采用——这是"切国际版却把国内版拉起来"的防线：
+ * 两档的 exe 名字不同（`WorkBuddy.exe` / `WorkBuddyAI.exe`），文件名对不上就说明
+ * 那条路径属于另一个档位，宁可去标准安装目录找，也不能跨档启动。
+ *
+ * 导出只为回归测试（`scripts/test-variant-process.mjs` 断言不跨档选 exe），生产路径由
+ * `launchWorkbuddy` / `restartWorkbuddy` 调用。
+ */
+export function findWorkbuddyExe(detectedPath, variant = 'cn') {
+  const v = getVariant(variant);
+  const wanted = v.exeNames.map((n) => n.toLowerCase());
+  const detected =
+    detectedPath && wanted.includes(path.basename(detectedPath).toLowerCase()) ? detectedPath : null;
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
   const candidates = [
-    detectedPath,
-    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
-    'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe',
-    'C:\\Program Files (x86)\\WorkBuddy\\WorkBuddy.exe',
-    path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
+    detected,
+    ...v.exeNames.map((n) => path.join(localAppData, 'Programs', v.appDirName, n)),
+    ...v.exeNames.map((n) => path.join('C:\\Program Files', v.appDirName, n)),
+    ...v.exeNames.map((n) => path.join('C:\\Program Files (x86)', v.appDirName, n)),
   ].filter(Boolean);
   return candidates.find((p) => {
     try {
@@ -524,21 +554,22 @@ function findWorkbuddyExe(detectedPath) {
 }
 
 /**
- * 枚举 WorkBuddy / CodeBuddy 的全部进程（判定「是否已退出」与「逐个关掉」都用它）。
+ * 枚举某一档客户端的全部进程（判定「是否已退出」与「逐个关掉」都用它）。
  *
  * 返回 `{ processes, method, complete?, warning?, error? }`。
  * `complete: false` 表示只用 tasklist 拿到了单个 PID（没有启动时间），
  * 此时靠 `taskkill /T` 杀进程树来兜底。
  * `error` 非空表示**无法判定**当前状态，调用方必须保守处理，不能当成"没在运行"。
  */
-export async function listWorkbuddyProcesses({ names = WORKBUDDY_PROCESS_NAMES } = {}) {
+export async function listWorkbuddyProcesses({ names, variant } = {}) {
+  const procs = resolveNames({ names, variant });
   if (process.platform === 'win32') {
     try {
-      return { processes: await listViaPowerShell(names), method: 'powershell', complete: true };
+      return { processes: await listViaPowerShell(procs), method: 'powershell', complete: true };
     } catch (err) {
       const psError = shortExecError(err);
       try {
-        const rows = await listViaTasklist(names);
+        const rows = await listViaTasklist(procs);
         return rows.length
           ? {
               processes: rows,
@@ -554,11 +585,11 @@ export async function listWorkbuddyProcesses({ names = WORKBUDDY_PROCESS_NAMES }
   }
   // macOS / Linux 主路径：ps 全量进程表（自动剔除本工具自己的进程子树，按启动时间升序）
   try {
-    return { processes: await listViaPs(names), method: 'ps', complete: true };
+    return { processes: await listViaPs(procs), method: 'ps', complete: true };
   } catch (err) {
     // 兜底用 pgrep：只拿得到 PID（无启动时间、无法剔除全部后代），
     // 仅剔除自己一个 PID——ps 都不可用的机器已经非常罕见， degraded 路径可接受
-    const pattern = names.map((n) => n.replace(/\.exe$/i, '')).join('|');
+    const pattern = procs.map((n) => n.replace(/\.exe$/i, '')).join('|');
     try {
       const stdout = await run('pgrep', ['-if', pattern], 8000);
       const processes = String(stdout)
@@ -604,7 +635,7 @@ function terminatePid(pid, force) {
 }
 
 /**
- * 退出 WorkBuddy（全部相关进程），并**确认真的消失了**才返回。
+ * 退出**某一档**客户端（该档的全部相关进程），并**确认真的消失了**才返回。
  *
  * 两步走：先 `taskkill`（不带 `/F`，向窗口发 WM_CLOSE，能保住正在落盘的数据），
  * 等不到就逐个 `/T /F` 强杀。第二步不是多余的——WorkBuddy 关窗会缩到系统托盘，
@@ -615,19 +646,26 @@ function terminatePid(pid, force) {
  * 二来先杀 helper 会被主进程立刻重新拉起来。反复枚举能让名单自然收敛
  * （先冒出来的子进程被清掉 → 主进程暴露出来 → 再清掉它），直到进程表真的空了。
  *
- * @returns `{ stopped, wasRunning, killed, forced, exePath }`；关不掉时抛错（绝不静默返回成功）
+ * `variant` 决定动哪一档：`'cn'` 只动国内版、`'ai'` 只动国际版、`'all'` 两档都动。
+ * 不传则沿用历史默认（国内版）。切号必须显式传目标账号所属档位——两档是两个客户端，
+ * 切国际版账号时去关国内版不但没用，还会把用户正在用的另一个客户端关掉。
+ *
+ * @returns `{ stopped, wasRunning, killed, forced, exePath, variant }`；关不掉时抛错（绝不静默返回成功）
  */
 export async function stopWorkbuddy({
-  names = WORKBUDDY_PROCESS_NAMES,
+  names,
+  variant,
   gracefulMs = STOP_GRACEFUL_MS,
   forceMs = STOP_FORCE_MS,
 } = {}) {
-  const first = await listWorkbuddyProcesses({ names });
+  const procs = resolveNames({ names, variant });
+  const label = variant && String(variant) !== 'all' ? appLabelOf(variant) : 'WorkBuddy';
+  const first = await listWorkbuddyProcesses({ names: procs });
   if (first.error) {
-    throw new Error(`无法确认 WorkBuddy 的运行状态（${first.error}），为安全起见没有结束任何进程`);
+    throw new Error(`无法确认 ${label} 的运行状态（${first.error}），为安全起见没有结束任何进程`);
   }
   if (!first.processes.length) {
-    return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null };
+    return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null, variant: variant || null };
   }
 
   const exePath = first.processes.find((p) => p.exePath)?.exePath || null;
@@ -640,8 +678,8 @@ export async function stopWorkbuddy({
   const round = async (force, timeoutMs) => {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const { processes, error } = await listWorkbuddyProcesses({ names });
-      if (error) throw new Error(`无法确认 WorkBuddy 是否已退出（${error}），已中止`);
+      const { processes, error } = await listWorkbuddyProcesses({ names: procs });
+      if (error) throw new Error(`无法确认 ${label} 是否已退出（${error}），已中止`);
       if (!processes.length) return true;
       for (const p of processes) killed.add(p.pid);
       for (const p of processes) await terminatePid(p.pid, force);
@@ -651,40 +689,44 @@ export async function stopWorkbuddy({
   };
 
   if (await round(false, gracefulMs)) {
-    return { stopped: true, wasRunning: true, killed: [...killed], forced: false, exePath };
+    return { stopped: true, wasRunning: true, killed: [...killed], forced: false, exePath, variant: variant || null };
   }
 
   if (!(await round(true, forceMs))) {
-    throw new Error(`无法退出 WorkBuddy（仍在运行：PID ${[...killed].join(', ')}），请手动退出后重试`);
+    throw new Error(`无法退出 ${label}（仍在运行：PID ${[...killed].join(', ')}），请手动退出后重试`);
   }
   // 进程刚没，让 SQLite 把 -wal/-shm 的句柄彻底放开，再动数据库
   await sleep(700);
-  const confirm = await waitUntilGone(1000, names);
-  if (!confirm.gone) throw new Error('WorkBuddy 退出后又重新启动，请手动退出后重试');
-  return { stopped: true, wasRunning: true, killed: [...killed], forced: true, exePath };
+  const confirm = await waitUntilGone(1000, procs);
+  if (!confirm.gone) throw new Error(`${label} 退出后又重新启动，请手动退出后重试`);
+  return { stopped: true, wasRunning: true, killed: [...killed], forced: true, exePath, variant: variant || null };
 }
 
 /**
- * 重新打开 WorkBuddy（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
+ * 重新打开**指定档位**的客户端（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
  * Windows 用 exe 直接拉起；macOS 从检测到的可执行文件路径反推 .app 包后用 `open`。
+ *
+ * `variant` 必须与刚刚 {@link stopWorkbuddy} 的档位一致：切国际版账号要拉起的是
+ * `WorkBuddyAI.exe`，拉起国内版等于什么都没生效（还平白多开一个客户端）。
  */
-export function launchWorkbuddy(exePath) {
+export function launchWorkbuddy(exePath, variant = 'cn') {
+  const label = appLabelOf(variant);
   if (process.platform === 'darwin') {
-    const bundle = findWorkbuddyAppBundle(exePath);
+    const bundle = findWorkbuddyAppBundle(exePath, variant);
     if (!bundle) {
-      throw new Error('未能定位 WorkBuddy 的 .app 包（/Applications 下未找到），请手动重新打开 WorkBuddy');
+      throw new Error(`未能定位 ${label} 的 .app 包（/Applications 下未找到），请手动重新打开 ${label}`);
     }
     const child = spawn('open', [bundle], { detached: true, stdio: 'ignore' });
     child.unref();
     return { launched: true, exePath: bundle };
   }
   if (process.platform !== 'win32') {
-    throw new Error(`当前平台（${process.platform}）不支持自动重新打开 WorkBuddy，请手动打开`);
+    throw new Error(`当前平台（${process.platform}）不支持自动重新打开 ${label}，请手动打开`);
   }
-  const exe = findWorkbuddyExe(exePath);
+  const exe = findWorkbuddyExe(exePath, variant);
   if (!exe) {
     throw new Error(
-      '未能定位 WorkBuddy 可执行文件，请手动重新打开 WorkBuddy。' + (exePath ? `（检测到的路径：${exePath}）` : '')
+      `未能定位 ${label} 可执行文件，请手动重新打开 ${label}。` + (exePath ? `（检测到的路径：${exePath}）` : '')
     );
   }
   const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
@@ -693,13 +735,13 @@ export function launchWorkbuddy(exePath) {
 }
 
 /** macOS：从检测到的可执行文件路径反推 .app 包路径（如 /Applications/WorkBuddy.app），失败按常见位置兜底 */
-function findWorkbuddyAppBundle(exePath) {
+function findWorkbuddyAppBundle(exePath, variant = 'cn') {
+  const v = getVariant(variant);
   const m = String(exePath || '').match(/^(\/.+?\.app)\//i);
   const candidates = [
     m?.[1],
-    '/Applications/WorkBuddy.app',
-    '/Applications/CodeBuddy.app',
-    path.join(os.homedir(), 'Applications', 'WorkBuddy.app'),
+    ...v.macBundles.map((b) => path.join('/Applications', b)),
+    ...v.macBundles.map((b) => path.join(os.homedir(), 'Applications', b)),
   ].filter(Boolean);
   return candidates.find((p) => {
     try {
@@ -710,17 +752,18 @@ function findWorkbuddyAppBundle(exePath) {
   });
 }
 
-export async function restartWorkbuddy() {
-  const proc = await detectWorkbuddyProcess();
-  if (!proc.running) throw new Error('未检测到运行中的 WorkBuddy 进程，无需重启（下次启动自动生效）');
+export async function restartWorkbuddy({ variant = 'cn' } = {}) {
+  const label = appLabelOf(variant);
+  const proc = await detectWorkbuddyProcess({ variant });
+  if (!proc.running) throw new Error(`未检测到运行中的 ${label} 进程，无需重启（下次启动自动生效）`);
   if (process.platform === 'win32') {
     if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');
     await run('taskkill', ['/PID', String(proc.pid), '/T', '/F'], 10000);
     await new Promise((r) => setTimeout(r, 1500));
-    const exe = findWorkbuddyExe(proc.exePath);
+    const exe = findWorkbuddyExe(proc.exePath, variant);
     if (!exe) {
       throw new Error(
-        '未能定位 WorkBuddy 可执行文件，请手动重新打开 WorkBuddy。' +
+        `未能定位 ${label} 可执行文件，请手动重新打开 ${label}。` +
           (proc.exePath ? `（检测到的路径：${proc.exePath}）` : '')
       );
     }
@@ -732,13 +775,13 @@ export async function restartWorkbuddy() {
     if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');
     await terminatePid(proc.pid, true);
     await new Promise((r) => setTimeout(r, 1500));
-    const bundle = findWorkbuddyAppBundle(proc.exePath);
+    const bundle = findWorkbuddyAppBundle(proc.exePath, variant);
     if (!bundle) {
-      throw new Error('未能定位 WorkBuddy 的 .app 包，请手动重新打开 WorkBuddy');
+      throw new Error(`未能定位 ${label} 的 .app 包，请手动重新打开 ${label}`);
     }
     const child = spawn('open', [bundle], { detached: true, stdio: 'ignore' });
     child.unref();
     return { restarted: true, exePath: bundle };
   }
-  throw new Error(`当前平台（${process.platform}）暂不支持自动重启，请手动重启 WorkBuddy`);
+  throw new Error(`当前平台（${process.platform}）暂不支持自动重启，请手动重启 ${label}`);
 }

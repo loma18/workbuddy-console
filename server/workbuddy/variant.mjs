@@ -6,6 +6,10 @@
  * - 绝不跨档位请求。国内版 token 只打国内域，国际版只打国际域，
  *   混用会污染统计并触发网关一致性校验失败。
  * - 登录态文件按档位分开，不能互相覆盖。
+ * - **进程也按档位分开**：两档是两个独立安装的客户端（`WorkBuddy.exe` /
+ *   `WorkBuddyAI.exe`），切国内版账号只该重启国内版，切国际版只该重启国际版。
+ *   早先"切号 = 结束 WorkBuddy + 重开 WorkBuddy"的写法是跨档的：切国际版账号时
+ *   关掉并拉起的是国内版客户端，国际版那份登录态压根没被重新读取（2026-10-26 反馈）。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -27,6 +31,18 @@ export const VARIANTS = {
     dataRootName: '.workbuddy',
     /** OAuth 申请 state 时的 platform 参数（与 workbuddy-switch 的 WORKBUDDY_PLATFORM 一致） */
     oauthPlatform: 'workbuddy',
+    /** 客户端显示名：提示文案里说"退出 / 重新打开 xxx"就用它 */
+    appLabel: 'WorkBuddy',
+    /**
+     * 进程映像名（Windows 按映像名精确匹配；macOS/Linux 按命令行匹配）。
+     * `CodeBuddy` 是旧版客户端的进程名，保留以兼容仍装旧版的机器。
+     */
+    processNames: ['WorkBuddy', 'CodeBuddy'],
+    /** Windows 安装目录名（`%LOCALAPPDATA%\Programs\<appDirName>`）与可执行文件名（首个为首选） */
+    appDirName: 'WorkBuddy',
+    exeNames: ['WorkBuddy.exe', 'CodeBuddy.exe'],
+    /** macOS .app 包名候选 */
+    macBundles: ['WorkBuddy.app', 'CodeBuddy.app'],
   },
   ai: {
     id: 'ai',
@@ -37,6 +53,12 @@ export const VARIANTS = {
     resourceUrl: 'https://www.workbuddy.ai/billing/meter/get-user-resource-summary',
     dataRootName: '.workbuddy-ai',
     oauthPlatform: 'workbuddy-ai',
+    appLabel: 'WorkBuddy AI',
+    // 国际版是**另一个客户端**：进程名、安装目录、可执行文件名都与国内版不同
+    processNames: ['WorkBuddyAI'],
+    appDirName: 'WorkBuddyAI',
+    exeNames: ['WorkBuddyAI.exe'],
+    macBundles: ['WorkBuddy AI.app', 'WorkBuddyAI.app'],
   },
 };
 
@@ -62,6 +84,25 @@ export function variantOf(account) {
   const raw = String(account?.variant || '').toLowerCase();
   if (raw === 'ai' || raw === 'workbuddy-ai' || raw === 'intl') return VARIANTS.ai;
   return VARIANTS.cn;
+}
+
+/** 两档进程名的并集：只有"退出全部"这种显式动作才用得到 */
+export const ALL_PROCESS_NAMES = [...new Set(VARIANT_LIST.flatMap((v) => v.processNames))];
+
+/**
+ * 某个档位对应的进程名。
+ *
+ * 传 `'all'` 返回两档并集（"退出全部"），其余按 {@link getVariant} 归一化——
+ * 传对象、传 `undefined` 都安全（undefined → 国内版，与历史默认一致）。
+ */
+export function processNamesFor(variant) {
+  if (String(variant) === 'all') return ALL_PROCESS_NAMES;
+  return getVariant(variant).processNames;
+}
+
+/** 档位的客户端显示名（'WorkBuddy' / 'WorkBuddy AI'），用于提示文案 */
+export function appLabelOf(variant) {
+  return getVariant(variant).appLabel;
 }
 
 /** 账号所属档位的数据根目录（会话日志所在处） */

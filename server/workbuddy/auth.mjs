@@ -47,7 +47,16 @@ export function buildAccountObject(account) {
     Object.assign(obj, structuredClone(raw));
   }
   obj.uid = account?.uid || '';
-  obj.nickname = account?.nickname || '';
+  /**
+   * 昵称可能也是加密信封（国际版实测 `account.nickname` 就是信封）。
+   * `account.nickname` 只保存可读字符串，信封留在 profile_raw 里；
+   * 这里不能拿空串把它覆盖掉，否则切换后客户端里的昵称会丢失。
+   */
+  if (typeof account?.nickname === 'string' && account.nickname.trim()) {
+    obj.nickname = account.nickname;
+  } else if (obj.nickname === undefined) {
+    obj.nickname = '';
+  }
   // 以下字段缺失时补默认值，避免 WorkBuddy 读到不完整结构
   const defaults = {
     type: 'personal',
@@ -365,8 +374,22 @@ export function importLocalAccount(variantId = 'cn') {
 
   const auth = doc.auth || {};
   const accessToken = auth.accessToken;
-  // 加密信封形态无法作为可切换凭据保存（没有明文），仍记录但标记为不可切换
-  const plainAccess = typeof accessToken === 'string' ? accessToken : '';
+  /**
+   * token 有两种形态：明文（OAuth 所得）或 WorkBuddy 5.6 加密信封
+   * （`{$wbEncrypted: 1, envelope: '...'}`）。**信封必须原样保存**。
+   *
+   * 早先这里把非字符串一律降级成 `''`，于是「登录态文件只写信封」的档位
+   * （实测国际版 `workbuddy-desktop-ai.info` 的 accessToken / refreshToken 都是信封，
+   * 国内版升级后同样如此）导入后两个字段都是空串，`isEnvelope()` 也就判不出来——
+   * 界面直接落到「无可用凭据」，切换 / 刷新 / 查余额全部失效（2026-10-26 反馈）。
+   *
+   * 保留信封的语义：
+   * - `hasPlainToken()` 依旧为 false（确实取不出明文，发不出带鉴权的请求）；
+   * - `isEnvelope()` 为真 → 界面显示「加密凭据」而不是误报「无可用凭据」；
+   * - `switchAccount()` 可以原样写回登录态，切换功能可用。
+   */
+  const keepSecret = (v) => (typeof v === 'string' && v.trim() ? v : isEnvelope(v) ? v : '');
+  const storedAccess = keepSecret(accessToken);
 
   const now = Date.now();
   const record = {
@@ -376,8 +399,8 @@ export function importLocalAccount(variantId = 'cn') {
     email: '',
     domain: auth.domain || variant.apiEndpoint,
     variant: variant.id,
-    access_token: plainAccess,
-    refresh_token: typeof auth.refreshToken === 'string' ? auth.refreshToken : '',
+    access_token: storedAccess,
+    refresh_token: keepSecret(auth.refreshToken),
     token_type: auth.tokenType || 'Bearer',
     expiresAt: Number(auth.expiresAt) || (Number(auth.expiresIn) ? now + Number(auth.expiresIn) * 1000 : 0),
     refreshExpiresAt: Number(auth.refreshExpiresAt) || 0,

@@ -263,10 +263,10 @@ export interface AccountInfo {
   refreshedAt: number | null;
   expiresAt: number | null;
   refreshExpiresAt: number | null;
-  /** 是否持有未过期的明文 access_token（决定能否切换） */
+  /** 是否持有未过期的明文 access_token（决定能否查余额/验活/刷新） */
   hasPlainToken: boolean;
   expired: boolean;
-  /** token 为 WorkBuddy 5.6 加密信封：不可作为可切换凭据 */
+  /** token 为 WorkBuddy 5.6 加密信封：可原样写回登录态用于切换，但取不出明文 */
   hasEnvelope: boolean;
   /** token 尾号，完整值永不返回前端 */
   masked: string;
@@ -413,6 +413,8 @@ export interface AppStopResult {
   /** 是否需要强杀（WorkBuddy 关窗会缩到托盘，优雅退出经常不够） */
   forced: boolean;
   exePath: string | null;
+  /** 本次退出针对的档位：'cn' / 'ai' / 'all'（不传时为 null） */
+  variant?: string | null;
 }
 
 /** 复制报告：copied 成功 / skipped 账本命中 / errors 逐条原因 */

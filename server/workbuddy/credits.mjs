@@ -17,6 +17,8 @@ import {
   loadAccounts,
   accountDisplayName,
   secretValue,
+  hasPlainAccessToken,
+  isEnvelope,
   findAccount,
   CREDIT_SNAPSHOTS_FILE,
   OFFICIAL_USAGE_CACHE_FILE,
@@ -96,6 +98,20 @@ async function authenticatedPost(account, url, body) {
  * - `valid: false` 但 `unauthorized: false` → 网络/接口异常，**不能**据此判定凭据失效。
  */
 export async function verifyAccountCredential(account) {
+  /**
+   * 没有明文 token 时**绝不能发请求**：`authHeaders()` 会退化成空 Bearer，
+   * 官方回 401，验活结果就被记成"凭据已失效"——而它其实只是取不出明文。
+   * 加密信封账号应显示"无法验活"，不是"已被拒绝"。
+   */
+  if (!hasPlainAccessToken(account)) {
+    return {
+      valid: false,
+      unauthorized: false,
+      message: isEnvelope(account?.access_token)
+        ? '该账号凭据为加密信封，取不出明文，无法验活'
+        : '该账号没有明文 access_token，无法验活',
+    };
+  }
   const variant = variantOf(account);
   try {
     await authenticatedPost(account, variant.resourceUrl, {});
@@ -669,6 +685,23 @@ export async function getAccountBalances({ refresh = false } = {}) {
       variant: variant.id,
       variantLabel: variant.label,
     };
+    /**
+     * 加密信封 / 未登录账号没有可发送的明文 token。
+     * 跳过而不是发空 Bearer：否则官方 401 会被当成"凭据已失效"，
+     * 卡片标题就会误报，而实际只是取不出明文（2026-10-26 反馈）。
+     */
+    if (!hasPlainAccessToken(account)) {
+      rows.push({
+        ...base,
+        balance: null,
+        balanceError: isEnvelope(account?.access_token)
+          ? '该账号凭据为加密信封，取不出明文，无法查询余额'
+          : '该账号没有明文凭据，无法查询余额',
+        error: null,
+        authInvalid: false,
+      });
+      continue;
+    }
     try {
       const b = await fetchBalance(account);
       recordSnapshot(account, b.total, b.remaining);
@@ -799,6 +832,13 @@ export async function getCreditDetails({ accountId, refresh = false } = {}) {
   const account = findAccount(accountId);
   if (!account) throw new Error('账号不存在');
   if (!account.uid) throw new Error('该账号缺少 uid，无法查询积分明细');
+  if (!hasPlainAccessToken(account)) {
+    throw new Error(
+      isEnvelope(account?.access_token)
+        ? '该账号凭据为加密信封，取不出明文，无法查询积分明细；请用「扫码添加账号」重新授权'
+        : '该账号没有明文凭据，无法查询积分明细；请重新导入或扫码添加账号'
+    );
+  }
 
   const now = Date.now();
   if (!refresh) {
@@ -879,6 +919,25 @@ export async function getCreditStatistics({ days = 30, refresh = false, variant 
       variant: variant.id,
       variantLabel: variant.label,
     };
+    /**
+     * 同余额查询：加密信封账号发不出带鉴权的请求，直接给出可读原因，
+     * 不要让它伪装成"查询失败 / 凭据失效"。
+     */
+    if (!hasPlainAccessToken(account)) {
+      const message = isEnvelope(account?.access_token)
+        ? '该账号凭据为加密信封，取不出明文，无法查询用量；请用「扫码添加账号」重新授权'
+        : '该账号没有明文凭据，无法查询用量；请重新导入或扫码添加账号';
+      accountsResult.push({
+        ...base,
+        requests: 0,
+        credit: 0,
+        balance: null,
+        balanceError: message,
+        error: message,
+      });
+      errors.push({ ...base, error: message });
+      continue;
+    }
     try {
       const rows = await fetchAccountUsage(account, days);
       collectedAt = now;

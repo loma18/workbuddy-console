@@ -10,8 +10,9 @@
  * 这个测试造出"两档各登录一个不同账号"的状态，逐条验收上面三点，并证明
  * **切换国际版不会动国内版的登录态文件**。
  *
- * 隔离：`HOME`（登录态文件路径）+ `WB_SWITCH_HOME`（账号库）都指到临时目录，
- * 且必须在 import 之前设置。
+ * 隔离：`HOME` / `LOCALAPPDATA` / `APPDATA`（登录态文件路径）+ `WB_SWITCH_HOME`
+ * （账号库）都指到临时目录，且必须在 import 之前设置。**Windows 的登录态路径走
+ * LOCALAPPDATA，只设 HOME 不够**——否则测试会覆盖本机真实的 WorkBuddy 登录态。
  *
  * 运行：node scripts/test-dual-variant.mjs
  */
@@ -21,6 +22,9 @@ import path from 'node:path';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-dual-variant-'));
 process.env.HOME = tmp;
+process.env.USERPROFILE = tmp;
+process.env.LOCALAPPDATA = path.join(tmp, 'appdata', 'local');
+process.env.APPDATA = path.join(tmp, 'appdata', 'roaming');
 process.env.WB_SWITCH_HOME = path.join(tmp, 'wb-switch');
 process.env.FREE_TOKEN_CONFIG_DIR = path.join(tmp, 'config');
 fs.mkdirSync(process.env.WB_SWITCH_HOME, { recursive: true });
@@ -37,6 +41,15 @@ const {
   switchAccount,
 } = await import('../server/workbuddy/auth.mjs');
 const { refreshPlan, refreshPlanFor } = await import('../server/workbuddy/tokenRefresh.mjs');
+
+// 最后一道保险：路径没落到临时目录就立刻停下，绝不能再碰真实登录态。
+for (const variantId of ['cn', 'ai']) {
+  const p = path.resolve(authFilePath(variantId));
+  const root = path.resolve(tmp) + path.sep;
+  if (!p.startsWith(root)) {
+    throw new Error(`测试隔离失败：${variantId} 登录态路径不在临时目录：${p}`);
+  }
+}
 
 let pass = 0;
 let fail = 0;

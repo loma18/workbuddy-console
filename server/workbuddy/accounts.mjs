@@ -81,10 +81,21 @@ export function secretValue(account, key) {
   return '';
 }
 
+/**
+ * 账号是否持有**明文** access_token（不管是否过期）。
+ *
+ * 与 {@link hasPlainToken} 的区别：这里只回答"能不能把 token 放进
+ * Authorization 头"，不判断有效期。加密信封与空值都不算——拿它们去发请求
+ * 只会得到 401，然后被误判成"凭据已失效"。
+ */
+export function hasPlainAccessToken(account) {
+  const token = secretValue(account, 'access_token');
+  return typeof token === 'string' && !!token.trim();
+}
+
 /** 账号是否持有可用的明文 access_token（OAuth 扫码所得形态） */
 export function hasPlainToken(account) {
-  const token = secretValue(account, 'access_token');
-  if (typeof token !== 'string' || !token.trim()) return false;
+  if (!hasPlainAccessToken(account)) return false;
   const exp = Number(account?.expiresAt);
   if (Number.isFinite(exp) && exp > 0) return exp > Date.now();
   return true; // 无过期时间时保守认为有效

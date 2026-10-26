@@ -41,11 +41,19 @@ const MAX_PROJECT_DEPTH = 4;
 /** 正文超过这个大小就跳过逐行 JSON 解析校验（只做「旧 id 不残留」校验），避免大文件卡住 */
 const JSONL_PARSE_LIMIT = 16 * 1024 * 1024;
 /**
- * 复制会话时 WorkBuddy 正在运行、且没有授权本工具自动退出的提示语
+ * 复制会话时客户端正在运行、且没有授权本工具自动退出的提示语
  * （与参考实现同口径：运行中的实例看不到写入，继续对话会让副本与源会话分叉）。
+ *
+ * 按档位给出具体客户端名——两档是两个客户端，说"退出 WorkBuddy"会让用国际版的用户
+ * 去关错程序（关掉国内版，国际版还在跑，写库照样被改写）。
  */
-export const APP_RUNNING_MESSAGE =
-  'WorkBuddy 正在运行，已阻止修改会话数据。请先退出 WorkBuddy，或勾选「先退出 WorkBuddy」由本工具自动结束它。';
+export function appRunningMessage(variant = 'cn') {
+  const label = getVariant(variant).appLabel;
+  return `${label} 正在运行，已阻止修改会话数据。请先退出 ${label}，或勾选「先退出 ${label}」由本工具自动结束它。`;
+}
+
+/** @deprecated 用 {@link appRunningMessage}：这里固定按国内版文案，仅为兼容旧调用方 */
+export const APP_RUNNING_MESSAGE = appRunningMessage('cn');
 
 /**
  * 复制时清空的「云端同步状态」列。
@@ -303,12 +311,13 @@ function recordCopies(variantId, sourceUid, targetUid, pairs) {
  * 测试机上真实 WorkBuddy 多半正在运行，会让门禁变成「永远拒绝」，两条分支都没法验证；
  * `WB_FAKE_STOP_FAIL=1` 配合前者模拟「进程关不掉」。生产路径不设置它们，走真实探测与真实关进程。
  */
-export async function ensureAppClosed({ stop = false } = {}) {
+export async function ensureAppClosed({ stop = false, variant = 'cn' } = {}) {
+  const runningMessage = appRunningMessage(variant);
   const fake = process.env.WB_FAKE_APP_RUNNING;
   if (fake === '1' || fake === 'true') {
-    if (!stop) throw new Error(APP_RUNNING_MESSAGE);
+    if (!stop) throw new Error(runningMessage);
     if (process.env.WB_FAKE_STOP_FAIL === '1') {
-      throw new Error('无法退出 WorkBuddy（测试模拟：进程关不掉），请手动退出后重试');
+      throw new Error(`无法退出 ${getVariant(variant).appLabel}（测试模拟：进程关不掉），请手动退出后重试`);
     }
     return { stopped: true, wasRunning: true, killed: [], forced: false, exePath: null, fake: true };
   }
@@ -316,15 +325,15 @@ export async function ensureAppClosed({ stop = false } = {}) {
     return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null, fake: true };
   }
 
-  const proc = await detectWorkbuddyProcess();
+  const proc = await detectWorkbuddyProcess({ variant });
   if (proc.running) {
-    if (!stop) throw new Error(APP_RUNNING_MESSAGE);
+    if (!stop) throw new Error(runningMessage);
     // 关不掉时 stopWorkbuddy 会抛错，这里不吞
-    return await stopWorkbuddy();
+    return await stopWorkbuddy({ variant });
   }
   if (proc.error) {
     throw new Error(
-      `无法确认 WorkBuddy 是否已退出（进程检测失败：${proc.error}）。为安全起见已阻止会话写入，请确认已退出后重试`
+      `无法确认 ${getVariant(variant).appLabel} 是否已退出（进程检测失败：${proc.error}）。为安全起见已阻止会话写入，请确认已退出后重试`
     );
   }
   return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: proc.exePath || null };
@@ -655,8 +664,9 @@ export async function copySessions({ targetAccountId, ids, stopApp = false }) {
   }
 
   // 写库前必须确认 App 已退出——这是唯一能保证副本不与源会话分叉的前提。
-  // stopApp=true 时由本工具直接结束 WorkBuddy 的进程（关不掉就抛错中止，不做无法判定的写入）。
-  const appStop = await ensureAppClosed({ stop: stopApp });
+  // stopApp=true 时由本工具直接结束**本档位**客户端的进程（关不掉就抛错中止，不做无法判定的写入）。
+  // 档位必须传对：国际版的会话库与国内版是两个目录，去关国内版不会让国际版停止写库。
+  const appStop = await ensureAppClosed({ stop: stopApp, variant: variantId });
 
   const root = sessionDataRoot(variantId);
   const index = indexProjectBodies(variantId);

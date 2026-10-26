@@ -44,7 +44,7 @@ import {
   getCreditDetails,
 } from './workbuddy/credits.mjs';
 import { refreshAccessToken } from './proxy/wb.mjs';
-import { VARIANT_LIST, authFilePath, dataRoot } from './workbuddy/variant.mjs';
+import { VARIANT_LIST, authFilePath, dataRoot, getVariant, variantOf } from './workbuddy/variant.mjs';
 import { checkinAll, checkinAccount, fetchCheckinStatus, loadCheckinLogs, allCheckedInToday, allGrowthDoneToday } from './workbuddy/checkin.mjs';
 import {
   refreshAccounts,
@@ -88,13 +88,16 @@ const wrap = (fn) => (req, res) => {
 };
 
 /**
- * 只有"确实是我们把 WorkBuddy 关掉的"才重新打开它，并保证**不把用户的应用留在关闭状态**。
+ * 只有"确实是我们把客户端关掉的"才重新打开它，并保证**不把用户的应用留在关闭状态**。
  * 重新打开本身失败只回报，不抛错——登录态已经写好，重启失败不该让整个切换算失败。
+ *
+ * `variant` 必须与被关掉的那一档一致：切国际版账号重新打开的是 `WorkBuddy AI`，
+ * 不是国内版（早先固定拉起 `WorkBuddy.exe`，切国际版等于开了个无关的客户端）。
  */
-async function relaunchIfStopped(appStop) {
+async function relaunchIfStopped(appStop, variant = 'cn') {
   if (!appStop?.wasRunning) return null;
   try {
-    return launchWorkbuddy(appStop.exePath);
+    return launchWorkbuddy(appStop.exePath, variant);
   } catch (err) {
     return { launched: false, error: err?.message || String(err) };
   }
@@ -328,9 +331,15 @@ app.get(
   '/api/workbuddy/status',
   wrap(async (req, res) => {
     const loaded = listLoaded();
-    const proc = await detectWorkbuddyProcess();
+    /**
+     * `variant` 只影响"运行状态"这一段：两档是两个客户端，账号页切到国际版时
+     * 该看的是 `WorkBuddy AI` 有没有在跑（默认国内版，模型配置也属于国内版）。
+     */
+    const variant = String(req.query.variant || 'cn') === 'ai' ? 'ai' : 'cn';
+    const proc = await detectWorkbuddyProcess({ variant });
     res.json({
       ...loaded,
+      variant,
       running: proc.running,
       exePath: proc.exePath || null,
       // 进程探测本身失败（而非"确实没运行"）时透出原因，避免界面给出错误结论
@@ -340,7 +349,8 @@ app.get(
       // 降级探测（tasklist）拿不到启动时间，无法自动判断"配置待重启"
       detectWarning: proc.warning || (proc.startTimeUnknown ? '未能获取进程启动时间，无法自动判断模型配置是否需要重启' : null),
       modelsJsonMtime: modelsJsonMtime(),
-      pendingRestart: isPendingRestart(proc), // 配置已变更但运行中的 WorkBuddy 尚未读取
+      // models.json 属于国内版数据目录，国际版的启动时间与它无关
+      pendingRestart: variant === 'cn' ? isPendingRestart(proc) : false,
     });
   })
 );
@@ -463,10 +473,11 @@ app.post('/api/workbuddy/remove', (req, res) => {
   res.json(removeModels(ids));
 });
 
+/** 重启国内版客户端让新载入的 models.json 生效（模型配置只属于国内版） */
 app.post(
   '/api/workbuddy/restart',
   wrap(async (req, res) => {
-    res.json(await restartWorkbuddy());
+    res.json(await restartWorkbuddy({ variant: 'cn' }));
   })
 );
 
@@ -605,9 +616,11 @@ app.get('/api/accounts', (req, res) => {
  * 切换账号：写登录态文件（内部先备份、失败回滚）。
  *
  * 两个可选动作，都由界面显式传入：
- * - `stopApp`：切换前**直接结束 WorkBuddy 的全部相关进程**（用户不必手动退出）。
+ * - `stopApp`：切换前**直接结束该档位客户端的全部相关进程**（用户不必手动退出）。
  *   运行中的实例会把登录态改写回原账号，所以不关掉的话切换本来就无效；
- *   关进程后还会**重新打开** WorkBuddy，让用户拿到一个已登录新账号的客户端。
+ *   关进程后还会**重新打开同一个客户端**，让用户拿到一个已登录新账号的客户端。
+ *   ⚠️ 只动**目标账号所属档位**：切国际版账号只重启 `WorkBuddy AI`，国内版客户端
+ *   原样不动（反之亦然）。两档是两个独立安装的客户端，跨档关进程既没用又扰民。
  * - `copySessionIds`：切换前把**当前登录账号**的这些会话复制给目标账号。
  *   顺序不能反——来源账号是「当前登录账号」，登录态一旦被改写就再也读不出源账号是谁。
  */
@@ -621,6 +634,10 @@ app.post(
 
     const target = findAccount(id);
     if (!target) return res.status(400).json({ error: '账号不存在' });
+
+    // 本次操作只与目标账号的档位有关：进程、可执行文件、文案全部跟着它走
+    const variantId = variantOf(target).id;
+    const appLabel = getVariant(variantId).appLabel;
 
     /**
      * 0) 凭据验活兜底：本机「未过期」不代表服务端认可。
@@ -666,13 +683,13 @@ app.post(
       }
     }
 
-    // 1) 先退出 WorkBuddy（未运行则空转）
+    // 1) 先退出该档位客户端（未运行则空转；另一档完全不受影响）
     let appStop = null;
     if (stopApp) {
       try {
-        appStop = await stopWorkbuddy();
+        appStop = await stopWorkbuddy({ variant: variantId });
       } catch (err) {
-        return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止切换：${err?.message || err}` });
+        return res.status(400).json({ error: `退出 ${appLabel} 失败，已中止切换：${err?.message || err}` });
       }
     }
 
@@ -683,7 +700,7 @@ app.post(
         sessionCopy = await copySessions({ targetAccountId: id, ids });
       } catch (err) {
         // 会话没复制成功就不要再动登录态了：用户的本意是"把对话带过去"，半途切号更糟
-        await relaunchIfStopped(appStop);
+        await relaunchIfStopped(appStop, variantId);
         return res.status(400).json({ error: `会话复制失败，已中止切换：${err?.message || err}` });
       }
     }
@@ -693,22 +710,27 @@ app.post(
     try {
       result = switchAccount(id);
     } catch (err) {
-      await relaunchIfStopped(appStop);
+      await relaunchIfStopped(appStop, variantId);
       throw err;
     }
-    const relaunch = await relaunchIfStopped(appStop);
+    const relaunch = await relaunchIfStopped(appStop, variantId);
     res.json({ ...result, sessionCopy, appStop, relaunch });
   })
 );
 
 /**
- * 退出 WorkBuddy（结束后台全部相关进程）。供界面上的「退出 WorkBuddy」按钮直接调用。
- * 返回 `{ stopped, wasRunning, killed, forced, exePath }`。
+ * 退出客户端（结束后台相关进程）。供界面上的「退出 xxx」按钮直接调用。
+ *
+ * `variant` 可选：`'cn'` / `'ai'` 只退对应档位，不传（或 `'all'`）退全部——
+ * 界面上那个按钮会带上当前查看的档位，用户点的是"退出 WorkBuddy AI"就只退国际版。
+ * 返回 `{ stopped, wasRunning, killed, forced, exePath, variant }`。
  */
 app.post(
   '/api/workbuddy/stop',
   wrap(async (req, res) => {
-    res.json(await stopWorkbuddy());
+    const raw = String(req.body?.variant || 'all');
+    const variant = raw === 'cn' || raw === 'ai' ? raw : 'all';
+    res.json(await stopWorkbuddy({ variant }));
   })
 );
 
@@ -812,9 +834,9 @@ app.get(
 /**
  * 把选中的会话复制给目标账号（副本用新 UUID，源账号数据不受影响）。
  *
- * `stopApp: true` 时由本工具先结束 WorkBuddy 的进程再复制，并在结束后重新打开它。
- * 进程生命周期放在这一层而不是 `copySessions` 里，是因为只有这里能保证
- * "无论复制成功还是失败都把用户的 WorkBuddy 重新打开"。
+ * `stopApp: true` 时由本工具先结束**目标账号所属档位**的客户端进程再复制，
+ * 并在结束后重新打开它。进程生命周期放在这一层而不是 `copySessions` 里，
+ * 是因为只有这里能保证"无论复制成功还是失败都把用户的客户端重新打开"。
  * `copySessions` 内部仍会自查 App 是否已退出（写库前的最后一道门）。
  */
 app.post(
@@ -823,19 +845,24 @@ app.post(
     const accountId = String(req.body?.accountId || '');
     if (!accountId) return res.status(400).json({ error: '缺少 accountId' });
 
+    const target = findAccount(accountId);
+    if (!target) return res.status(400).json({ error: '账号不存在' });
+    const variantId = variantOf(target).id;
+    const appLabel = getVariant(variantId).appLabel;
+
     let appStop = null;
     if (req.body?.stopApp === true) {
       try {
-        appStop = await stopWorkbuddy();
+        appStop = await stopWorkbuddy({ variant: variantId });
       } catch (err) {
-        return res.status(400).json({ error: `退出 WorkBuddy 失败，已中止复制：${err?.message || err}` });
+        return res.status(400).json({ error: `退出 ${appLabel} 失败，已中止复制：${err?.message || err}` });
       }
     }
     try {
       const report = await copySessions({ targetAccountId: accountId, ids: req.body?.ids });
-      res.json({ ...report, appStop, relaunch: await relaunchIfStopped(appStop) });
+      res.json({ ...report, appStop, relaunch: await relaunchIfStopped(appStop, variantId) });
     } catch (err) {
-      await relaunchIfStopped(appStop);
+      await relaunchIfStopped(appStop, variantId);
       throw err;
     }
   })
@@ -961,11 +988,12 @@ app.put(
 );
 
 // 重新自动检测 WorkBuddy 数据目录（并附带运行状态）
+// 数据目录与 models.json 都是国内版的事，这里的运行状态只看国内版客户端
 app.get(
   '/api/workbuddy/detect',
   wrap(async (req, res) => {
     const detected = detectWorkbuddyDir();
-    const proc = await detectWorkbuddyProcess();
+    const proc = await detectWorkbuddyProcess({ variant: 'cn' });
     res.json({
       detected,
       running: proc.running,
