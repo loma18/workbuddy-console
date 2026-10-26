@@ -424,8 +424,13 @@ export function buildRecord(remote, { now = Date.now(), deviceName = 'android' }
  * 用户在本机改的备注、头像、企业信息不能被手机端的瘦数据抹掉。
  */
 export function applyRemoteToLocal(local, remote, { now = Date.now(), deviceName = 'android' } = {}) {
-  const expiresAt = toMs(remote.expiresAt);
-  const refreshExpiresAt = toMs(remote.refreshExpiresAt);
+  /**
+   * 入站的时间戳可能是 0（"未知"）：手机端早期版本的推送完全不带 `refreshExpiresAt`，
+   * 扫码得到的记录也可能没有 refresh 有效期。**不能拿 0 把本地已知的有效期抹掉**——
+   * 否则一次同步就让电脑端从"refresh 还剩 10 天"退化成"未知"。
+   */
+  const expiresAt = toMs(remote.expiresAt) || Number(local.expiresAt) || 0;
+  const refreshExpiresAt = toMs(remote.refreshExpiresAt) || Number(local.refreshExpiresAt) || 0;
   const refreshedAt = toMs(remote.obtainedAt) || now;
   const next = {
     ...local,

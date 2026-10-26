@@ -790,7 +790,14 @@ export default function SettingsPage() {
                         : '未验活'}
                     </Badge>
                   </span>
-                  <span className="ml-auto tabular-nums text-zinc-400">
+                  <span
+                    className="ml-auto cursor-help tabular-nums text-zinc-400"
+                    title={
+                      '两个有效期是独立的两条线：access 到期只需用 refresh 换一份，refresh 到期才是真的没救。\n' +
+                      '「未知」= 这条账号记录里没有该有效期字段（扫码接口不返回 refresh 有效期，手机端早期推送也不带），' +
+                      '不是读取失败；等它下次被刷新时会补上。'
+                    }
+                  >
                     access {fmtHours(a.accessHours)} · refresh {fmtHours(a.refreshHours)}
                   </span>
                 </li>

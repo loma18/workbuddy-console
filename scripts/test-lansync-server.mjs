@@ -142,6 +142,9 @@ try {
           refreshToken: 'RT_PHONE',
           // a 端是「秒」
           expiresAt: Math.floor((NOW + 3600_000) / 1000),
+          // refresh 的有效期也要跟着走：早先协议漏了这个字段，
+          // 手机推过来的账号在电脑端永远显示「refresh 未知」
+          refreshExpiresAt: Math.floor((NOW + 14 * 86400_000) / 1000),
           obtainedAt: NOW - 60_000,
         },
       ],
@@ -158,6 +161,12 @@ try {
     const onDisk = loadAccounts().find((a) => a.uid === 'u-new');
     check('真的写进账号库了', !!onDisk);
     check('落库的 expiresAt 是毫秒', onDisk?.expiresAt > 1e12, onDisk?.expiresAt);
+    check(
+      '落库的 refreshExpiresAt 也是毫秒（14 天）',
+      Math.abs((onDisk?.refreshExpiresAt || 0) - (NOW + 14 * 86400_000)) < 60_000,
+      onDisk?.refreshExpiresAt
+    );
+    check('回传 refreshExpiresAt 给手机', acc.refreshExpiresAt === Math.floor((NOW + 14 * 86400_000) / 1000), acc.refreshExpiresAt);
     check('落库的 syncVersion = 1', onDisk?.syncVersion === 1, onDisk?.syncVersion);
     createdUid = onDisk?.uid || '';
   }
@@ -242,6 +251,13 @@ try {
     check('force 下动作为 adopt', j.results?.[0]?.action === 'adopt', j.results?.[0]?.action);
     check('落库换成新 token', loadAccounts().find((a) => a.uid === 'u-new')?.refresh_token === 'RT_RESCAN');
     check('版本继续单调递增', (loadAccounts().find((a) => a.uid === 'u-new')?.syncVersion || 0) > 5);
+    // 本次推送没带 refreshExpiresAt（模拟旧版手机）：不能把电脑端已知的有效期抹成 0
+    const after = loadAccounts().find((a) => a.uid === 'u-new');
+    check(
+      '缺字段时不抹掉已知的 refreshExpiresAt',
+      Math.abs((after?.refreshExpiresAt || 0) - (NOW + 14 * 86400_000)) < 60_000,
+      after?.refreshExpiresAt
+    );
   }
 
   /* ------------------------------------------------------------------ */
