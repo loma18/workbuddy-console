@@ -201,11 +201,17 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 | --- | --- |
 | 端口 | 默认 `57900`（可改，避开主服务端口） |
 | 监听 | `0.0.0.0`，仅 IPv4 |
-| 端点 | `GET /api/lansync/ping`、`POST /api/lansync/push`、`GET /api/lansync/pending`、`POST /api/lansync/ack` |
+| 端点 | `GET /api/lansync/ping`、`POST /api/lansync/push`、`POST /api/lansync/fetch`、`GET /api/lansync/pending`、`POST /api/lansync/ack` |
 | 鉴权 | `Authorization: Bearer <配对码>`，常量时间比较 |
 | 限制 | 每 IP 每分钟 60 次；请求体 ≤ 512KB；单批 ≤ 200 个账号 |
 
 配对码首次开启时自动生成，可在设置页重置（重置后所有手机都要重新填）。
+
+### 只读取凭据（`/api/lansync/fetch`）
+
+手机端「从电脑同步凭据」用：手机某个账号的 access token 过期了、电脑端那份还活着，就按 uid 把电脑端的值读回去。
+
+这个端点**一行都不写盘**——走 `push` 会先做一次合并裁决，存在把手机端死凭据写进电脑端的可能。返回体与 `push` 的 `account` 同一结构，额外带 `encrypted`（加密信封账号取不出明文，手机端据此给准确提示）。
 
 ### 冲突规则（功能核心）
 
@@ -213,7 +219,7 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 
 | 情况 | 动作 | 写库 |
 | --- | --- | --- |
-| 本地没有该账号 | 新建 | ✅ |
+| 本地没有该账号 | 新建（手机「同步选中账号」即等于在电脑端建号） | ✅ |
 | **当前登录账号**（两档任一） | 不动，只回传本地凭据 | ❌ force 也不行 |
 | 本地是加密信封（`$wbEncrypted`） | 不动 | ❌ |
 | 远端版本落后于本地 `syncVersion` | 不动 | ❌ |
@@ -235,6 +241,8 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 
 这样电脑不需要知道手机地址，手机也不需要开监听端口。
 
+账号页每 15 秒静默拉一次 `/api/accounts`（内容不变就不重渲染）：手机推过来的新账号会自己出现在列表里，不必手动刷新页面。
+
 ### 注意事项
 
 - 两台设备必须**同一局域网**。手机在外网时连不上家里的电脑，需要中继（本工具不提供）。
@@ -248,7 +256,7 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 ```bash
 npm run test:dual           # 36 项：两档位登录态分离、切换不互相覆盖
 npm run test:lansync        # 92 项：冲突裁决时序
-npm run test:lansync:http   # 37 项：鉴权、落库、队列、异常请求体
+npm run test:lansync:http   # 48 项：鉴权、落库、只读取凭据、队列、异常请求体
 ```
 
 ## 版本自检（左下角的升级按钮）

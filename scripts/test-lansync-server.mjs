@@ -263,7 +263,38 @@ try {
   }
 
   /* ------------------------------------------------------------------ */
-  section('8. 待同步队列：入队 → 拉取 → ack');
+  section('8. 只读取凭据（fetch，不写盘）');
+  /* ------------------------------------------------------------------ */
+  {
+    // 手机端「从电脑同步凭据」走这里：只读，绝不改电脑端账号库
+    const before = JSON.stringify(loadAccounts());
+
+    const r = await post('/api/lansync/fetch', { uids: ['u1'] });
+    const j = await r.json();
+    const live = loadAccounts().find((a) => a.uid === 'u1');
+    check('fetch 200', r.status === 200, r.status);
+    check('按 uid 命中 1 个', j.count === 1, j.count);
+    check('回传 a 的字段名', j.accounts?.[0]?.token === live.access_token, j.accounts?.[0]?.token ? 'set' : 'empty');
+    check('回传秒级过期时间', typeof j.accounts?.[0]?.expiresAt === 'number' && j.accounts[0].expiresAt < 1e11);
+    check('回传刷新版本', j.accounts?.[0]?.version === (Number(live.syncVersion) || 0), j.accounts?.[0]?.version);
+    check('明文账号标记 encrypted=false', j.accounts?.[0]?.encrypted === false, j.accounts?.[0]?.encrypted);
+    check('一行都没写盘', JSON.stringify(loadAccounts()) === before);
+
+    const miss = await post('/api/lansync/fetch', { uids: ['不存在的账号'] });
+    check('未命中返回空数组', (await miss.json()).count === 0);
+
+    const all = await post('/api/lansync/fetch', {});
+    check('不传 uids 返回全部', (await all.json()).count === loadAccounts().length);
+
+    const badShape = await post('/api/lansync/fetch', { uids: 'u1' });
+    check('uids 非数组 → 400', badShape.status === 400, badShape.status);
+
+    const noAuth = await post('/api/lansync/fetch', { uids: ['u1'] }, null);
+    check('fetch 也要鉴权', noAuth.status === 401, noAuth.status);
+  }
+
+  /* ------------------------------------------------------------------ */
+  section('9. 待同步队列：入队 → 拉取 → ack');
   /* ------------------------------------------------------------------ */
   {
     clearPending();
@@ -291,7 +322,7 @@ try {
   }
 
   /* ------------------------------------------------------------------ */
-  section('9. 未启用同步时不入队');
+  section('10. 未启用同步时不入队');
   /* ------------------------------------------------------------------ */
   {
     // 直接改配置为关闭，钩子应跳过

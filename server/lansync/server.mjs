@@ -15,6 +15,7 @@
  * | --- | --- | --- | --- |
  * | GET  | /api/lansync/ping    | 否 | 手机端探测"是否在线 / 是否需要配对" |
  * | POST | /api/lansync/push    | 是 | 手机把账号凭据推过来，回传电脑端最新凭据 |
+ * | POST | /api/lansync/fetch   | 是 | 手机按 uid **只读**取回电脑端凭据（不落库） |
  * | GET  | /api/lansync/pending | 是 | 手机拉取"电脑刷新过、还没通知手机"的凭据 |
  * | POST | /api/lansync/ack     | 是 | 手机确认收到，出队 |
  *
@@ -40,6 +41,7 @@ import {
   serializeAccount,
   safeEqual,
   toSec,
+  isEnvelope,
 } from './protocol.mjs';
 import { planMerge, materialize, WRITE_ACTIONS, ACTIONS } from './merge.mjs';
 import { listPending, ackPending } from './state.mjs';
@@ -262,6 +264,51 @@ export async function startLanSync({ port, getPairCode, getRefreshOnPush, onLog 
       device,
       summary,
       results,
+    });
+  });
+
+  /* ---------------- 只读：按 uid 取回凭据 ---------------- */
+
+  /**
+   * 手机端「从电脑同步凭据」用。
+   *
+   * 与 push 的区别只有一个但很关键：**这里一行都不写盘**。手机端某个账号的 access
+   * token 过期了、电脑端那份还活着时，把它读回去即可；走 push 会先做一次合并裁决，
+   * 存在把手机端的死凭据写进电脑端的可能。
+   *
+   * 只返回明文凭据：加密信封账号的 `access_token` 是对象，序列化后是空串，
+   * 同时用 `encrypted: true` 明确告诉手机端"这个取不出来"，让它给准确提示。
+   */
+  app.post('/api/lansync/fetch', auth, (req, res) => {
+    const raw = req.body?.uids;
+    if (raw !== undefined && !Array.isArray(raw)) {
+      return res.status(400).json({ error: 'uids 必须是数组' });
+    }
+    const uids = Array.isArray(raw) ? raw.map((x) => String(x)).filter(Boolean) : [];
+    const currentUids = currentUidsSafe();
+    const locals = loadAccounts();
+    const picked = uids.length
+      ? locals.filter((a) => {
+          const key = String(a?.uid || a?.id || '');
+          return !!key && uids.includes(key);
+        })
+      : locals;
+
+    const accounts = picked.map((a) => ({
+      ...serializeAccount(a, {
+        isCurrent: !!(a?.uid && currentUids.includes(String(a.uid))),
+        version: Number(a?.syncVersion) || 0,
+      }),
+      encrypted: isEnvelope(a?.access_token),
+    }));
+
+    onLog(`手机读取凭据：请求 ${uids.length} 个，命中 ${accounts.length} 个`);
+    res.json({
+      ok: true,
+      protocol: PROTOCOL_VERSION,
+      serverTime: Date.now(),
+      count: accounts.length,
+      accounts,
     });
   });
 

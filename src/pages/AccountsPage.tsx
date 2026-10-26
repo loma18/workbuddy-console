@@ -36,6 +36,7 @@ import { del, get, patch, post, TIMEOUT } from '../lib/api';
 import { fmtDateTime } from '../lib/format';
 import type {
   AccountBalancesResponse,
+  AccountCredential,
   AccountInfo,
   AccountRefreshRunResponse,
   AccountsResponse,
@@ -100,6 +101,42 @@ function fmtClock(ts: number | null | undefined): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return '—';
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * 凭据到期：`MM/DD HH:mm`；0 / 缺值一律写「未知」。
+ *
+ * 不能复用 `fmtPkgExpiry`——那个把空值写成「长期有效」，那是积分包的口径，
+ * 套到 token 上会变成"这份凭据永远不会过期"的危险误导。
+ */
+function fmtExpiryShort(ts: number | null | undefined): string {
+  if (!ts || ts <= 0) return '未知';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '未知';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${hh}:${mm}`;
+}
+
+/** 到期还剩多久（人话）；已过期直接说已过期 */
+function fmtRemain(ts: number): string {
+  const hours = (ts - Date.now()) / 3_600_000;
+  if (hours <= 0) return '已过期';
+  if (hours < 48) return `剩余 ${hours.toFixed(1)} 小时`;
+  return `剩余 ${(hours / 24).toFixed(1)} 天`;
+}
+
+/** 凭据到期：完整时刻 + 剩余量。两个 token 各算各的，不共用一个时间 */
+function fmtCredExpiry(ts: number | null | undefined): string {
+  if (!ts || ts <= 0) return '未知（这条记录没带这个时间）';
+  return `${fmtFullDateTime(ts)}（${fmtRemain(ts)}）`;
+}
+
+/** token 掩码：首 8 + 尾 8——保留首尾正是为了肉眼比对两份凭据是不是同一条链 */
+function maskCredential(value: string): string {
+  if (!value) return '（空）';
+  if (value.length <= 20) return '••••••';
+  return `${value.slice(0, 8)}…${value.slice(-8)}`;
 }
 
 function Avatar({ name, seed, size = 'md' }: { name: string; seed: string; size?: 'md' | 'lg' }) {
@@ -215,6 +252,7 @@ function AccountCard({
   onRename,
   onDelete,
   onShowPackages,
+  onShowCredential,
 }: {
   account: AccountInfo;
   isCurrent: boolean;
@@ -229,6 +267,8 @@ function AccountCard({
   onRename: () => void;
   onDelete: () => void;
   onShowPackages: () => void;
+  /** 打开「凭据」弹窗（按需拉取完整 access / refresh） */
+  onShowCredential: () => void;
 }) {
   /**
    * 凭据状态：以**服务端验活结论**为准（定时巡检每 6 小时刷新一次，结果落盘）。
@@ -309,6 +349,14 @@ function AccountCard({
                 <Badge color={credState.color}>{credState.text}</Badge>
               </span>
             </div>
+            {/* access / refresh 是两条独立的时间线：前者过期只需换一份，
+                后者过期才是真的没救，所以分别标出，不用一个「有效期」混着写 */}
+            <p
+              className="mt-1 truncate font-mono text-[11px] leading-4 text-zinc-400"
+              title="access_token 与 refresh_token 各自的到期时间"
+            >
+              access {fmtExpiryShort(account.expiresAt)} · refresh {fmtExpiryShort(account.refreshExpiresAt)}
+            </p>
           </div>
         </div>
       </header>
@@ -425,6 +473,15 @@ function AccountCard({
         </Button>
         <Button
           size="sm"
+          className="h-7 rounded-full px-2.5 pr-3.5 text-xs"
+          onClick={onShowCredential}
+          title="查看该账号的 access_token / refresh_token 及各自到期时间（只读）"
+        >
+          <IconInfo className="w-3.5 h-3.5" />
+          凭据
+        </Button>
+        <Button
+          size="sm"
           variant="danger"
           className="ml-auto h-7 rounded-full px-2.5 text-xs"
           onClick={onDelete}
@@ -522,6 +579,145 @@ function RenameDialog({
             手机号从登录态中的 profile_raw 实时读取，不额外存储一份副本。
           </p>
         </div>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * 「凭据」弹窗：access_token / refresh_token 以及**各自**的到期时间。
+ *
+ * 为什么按需拉取：列表接口刻意不带明文 token（`accountMeta` 只给尾号），
+ * 完整值只在用户主动点开时从 `/api/accounts/:id/credential` 取一次，不点就不出网络。
+ *
+ * 为什么两条时间线分开写：`expiresAt` 是 access 的（通常几小时），
+ * `refreshExpiresAt` 是 refresh 的（通常几十天）。access 过期只需换一份，
+ * refresh 过期才是真的没救——合写成一句「凭据 有效期至…」会把这两种情况混掉。
+ */
+function CredentialDialog({ account, onClose }: { account: AccountInfo | null; onClose: () => void }) {
+  const toast = useToast();
+  const [cred, setCred] = useState<AccountCredential | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [revealed, setRevealed] = useState(false);
+
+  const accountId = account?.id || '';
+  useEffect(() => {
+    if (!accountId) return;
+    let alive = true;
+    setCred(null);
+    setError('');
+    setRevealed(false);
+    setLoading(true);
+    get<AccountCredential>(`/api/accounts/${encodeURIComponent(accountId)}/credential`)
+      .then((r) => {
+        if (alive) setCred(r);
+      })
+      .catch((e: any) => {
+        if (alive) setError(e?.message || '读取凭据失败');
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [accountId]);
+
+  if (!account) return null;
+
+  const copy = async (text: string, label: string) => {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('ok', `${label} 已复制`);
+    } catch {
+      toast('err', '复制失败，请手动选择文本');
+    }
+  };
+
+  const rows = [
+    {
+      key: 'access',
+      label: 'access_token',
+      value: cred?.accessToken || '',
+      expiry: cred?.expiresAt || 0,
+      hint: '过期后可用 refresh_token 换一份新的，账号本身没死',
+    },
+    {
+      key: 'refresh',
+      label: 'refresh_token',
+      value: cred?.refreshToken || '',
+      expiry: cred?.refreshExpiresAt || 0,
+      hint: '轮换式：一次刷新成功，另一台手里的这份立刻作废',
+    },
+  ] as const;
+
+  return (
+    <Modal
+      open={!!account}
+      onClose={onClose}
+      title={`凭据「${account.name}」`}
+      subtitle="只读取，不会改动账号库"
+      footer={<Button onClick={onClose}>关闭</Button>}
+    >
+      <div className="space-y-3">
+        {/* 失效状态下也照常展示（排查"为什么切不过去"要看的就是这份值），
+            但必须先说清楚它已经不是可用的凭据，避免被当成有效 token 复制走 */}
+        {(account.expired || account.verify?.unauthorized || !account.hasPlainToken) && (
+          <p className="rounded-lg bg-amber-50 px-3 py-2 text-[11px] leading-4 text-amber-700">
+            {account.verify?.unauthorized
+              ? `服务端已于 ${fmtClock(account.verify.at)} 拒绝这份凭据（已被轮换或吊销），下面的 token 仅供对照排查`
+              : !account.hasPlainToken
+                ? '该账号没有明文凭据（加密信封或未登录），下面能读到的值不完整'
+                : '本地记录的 access_token 已过期，下面的时间与值仅供对照排查'}
+          </p>
+        )}
+        {loading && (
+          <div className="flex items-center gap-2 text-sm text-zinc-500">
+            <Spinner className="w-4 h-4" /> 正在读取凭据…
+          </div>
+        )}
+        {error && <p className="text-sm text-red-500">{error}</p>}
+        {cred && (
+          <>
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] leading-4 text-zinc-400">完整值含敏感信息，注意截图与屏幕共享</p>
+              <Button size="sm" variant="subtle" onClick={() => setRevealed((v) => !v)}>
+                {revealed ? '掩码显示' : '显示完整'}
+              </Button>
+            </div>
+            {rows.map((r) => (
+              <div key={r.key} className="rounded-xl border border-zinc-200 p-3">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-[11px] font-medium text-zinc-500">{r.label}</span>
+                  <span className="ml-auto">
+                    <Button size="sm" variant="subtle" disabled={!r.value} onClick={() => copy(r.value, r.label)}>
+                      <IconCopy className="w-3.5 h-3.5" />
+                      复制
+                    </Button>
+                  </span>
+                </div>
+                <p className="mt-1.5 select-all break-all font-mono text-[11px] leading-4 text-zinc-700">
+                  {r.value
+                    ? revealed
+                      ? r.value
+                      : maskCredential(r.value)
+                    : cred.encrypted && r.key === 'access'
+                      ? '加密信封，取不出明文'
+                      : '（空）'}
+                </p>
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  {r.label} 到期：{fmtCredExpiry(r.expiry)}
+                </p>
+                <p className="mt-0.5 text-[11px] leading-4 text-zinc-400">{r.hint}</p>
+              </div>
+            ))}
+            {cred.refreshedAt > 0 && (
+              <p className="text-[11px] text-zinc-400">最近一次刷新：{fmtFullDateTime(cred.refreshedAt)}</p>
+            )}
+          </>
+        )}
       </div>
     </Modal>
   );
@@ -1556,6 +1752,8 @@ export default function AccountsPage() {
   const [importing, setImporting] = useState<string | null>(null);
   const [editing, setEditing] = useState<AccountInfo | null>(null);
   const [pkgTarget, setPkgTarget] = useState<AccountInfo | null>(null);
+  /** 凭据弹窗目标（完整 access / refresh 按需拉取） */
+  const [credTarget, setCredTarget] = useState<AccountInfo | null>(null);
   /** 扫码添加账号弹窗（OAuth 设备码流程） */
   const [scanOpen, setScanOpen] = useState(false);
   /** 档位筛选：与 workbuddy-switch 一致，两套登录态分开管理 */
@@ -1592,14 +1790,51 @@ export default function AccountsPage() {
     }
   }, []);
 
+
+  /** 供轮询比对用：最新一次已渲染的数据（避免把 data 写进 interval 的闭包） */
+  const dataRef = useRef<AccountsResponse | null>(null);
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  /**
+   * 静默刷新账号列表。
+   *
+   * 手机端「同步选中账号」会在电脑端账号库**新建**它没有的账号（合并规则：本地没有 → create），
+   * 本页没有任何推送通道（只有 HTTP 轮询），不主动拉一次就永远看不到新账号——
+   * 这就是"手机上点了同步、电脑上还是空的"的来源。
+   *
+   * 内容没变就不 setState，避免定时器把整页重渲染一遍；发现新账号时顺带补一次余额查询，
+   * 否则新卡片会一直显示"余额暂不可用"。
+   */
+  const loadQuiet = useCallback(async () => {
+    if (document.visibilityState !== 'visible') return;
+    try {
+      const next = await get<AccountsResponse>('/api/accounts');
+      const prev = dataRef.current;
+      if (JSON.stringify(prev) === JSON.stringify(next)) return;
+      const prevIds = new Set((prev?.accounts || []).map((a) => a.id));
+      const grew = (next.accounts || []).some((a) => !prevIds.has(a.id));
+      setData(next);
+      dataRef.current = next;
+      if (grew) void loadBalances();
+    } catch {
+      /* 轮询失败不打扰：列表还在，用户可手动刷新 */
+    }
+  }, [loadBalances]);
+
   useEffect(() => {
     load();
     void loadBalances();
     const loadWb = () => get<LoadedInfo>('/api/workbuddy/status').then((i) => setWbRunning(!!i?.running)).catch(() => {});
     loadWb();
-    const t = setInterval(loadWb, 30_000);
+    // 15 秒一次静默刷新：手机端推送新账号后不必手动刷新页面（本机 JSON，开销可忽略）
+    const t = setInterval(() => {
+      void loadQuiet();
+      loadWb();
+    }, 15_000);
     return () => clearInterval(t);
-  }, [load, loadBalances]);
+  }, [load, loadBalances, loadQuiet]);
 
   // 首次拿到数据后，档位默认跟着当前登录态走
   useEffect(() => {
@@ -2074,6 +2309,7 @@ export default function AccountsPage() {
                 onRefreshToken={() => doRefreshToken(a)}
                 onDelete={() => doDelete(a)}
                 onShowPackages={() => setPkgTarget(a)}
+                onShowCredential={() => setCredTarget(a)}
               />
             ))}
           </div>
@@ -2094,6 +2330,7 @@ export default function AccountsPage() {
       </div>
 
       <RenameDialog account={editing} onClose={() => setEditing(null)} onSaved={load} />
+      <CredentialDialog account={credTarget} onClose={() => setCredTarget(null)} />
       <SessionCopyDialog
         open={!!sessionTarget}
         target={sessionTarget}

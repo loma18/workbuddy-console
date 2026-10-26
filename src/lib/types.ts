@@ -277,6 +277,27 @@ export interface AccountInfo {
   verify?: CredentialVerifyState | null;
 }
 
+/**
+ * 单个账号的完整凭据（`GET /api/accounts/:id/credential` 按需拉取）。
+ *
+ * 列表接口 `accountMeta` 刻意只给尾号，完整值只在这条按需通道里出现。
+ * `expiresAt` 与 `refreshExpiresAt` 是**两条独立的时间线**，不能互相顶替。
+ */
+export interface AccountCredential {
+  id: string;
+  uid: string;
+  accessToken: string;
+  refreshToken: string;
+  /** access_token 到期（毫秒）；0 = 未知 */
+  expiresAt: number;
+  /** refresh_token 到期（毫秒）；0 = 未知 */
+  refreshExpiresAt: number;
+  /** 毫秒：最近一次刷新时刻 */
+  refreshedAt: number;
+  /** access_token 是加密信封：取不出明文 */
+  encrypted: boolean;
+}
+
 /** 服务端验活结论（不含任何 token） */
 export interface CredentialVerifyState {
   at: number;

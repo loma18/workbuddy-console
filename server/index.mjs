@@ -27,7 +27,7 @@ import {
 } from './targets/workbuddy.mjs';
 import { getStats } from './stats/workbuddyStats.mjs';
 import { getProxyUrl } from './proxy.mjs';
-import { loadAccounts, accountMeta, findAccount, accountDisplayName } from './workbuddy/accounts.mjs';
+import { loadAccounts, accountMeta, findAccount, accountDisplayName, secretValue, isEnvelope } from './workbuddy/accounts.mjs';
 import { oauthStart, oauthPoll } from './workbuddy/oauth.mjs';
 import {
   switchAccount,
@@ -750,6 +750,36 @@ app.delete('/api/accounts/:id', (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err?.message || '删除失败' });
   }
+});
+
+/**
+ * 单个账号的**完整凭据**（access / refresh + 各自的过期时间）。
+ *
+ * 为什么单独开一个端点：`/api/accounts` 的 `accountMeta` 刻意只给尾号，
+ * 列表接口不带明文 token。而排查"手机和电脑谁手里那份才是活的"必须逐字比对，
+ * 所以这里做成按需拉取——用户点开某张卡片的「凭据」才请求，不点就不出网络。
+ *
+ * 两个过期时间不能混：`expiresAt` 是 access 的，`refreshExpiresAt` 是 refresh 的。
+ * 前者过期只需换一份，后者过期才是真的没救。
+ */
+app.get('/api/accounts/:id/credential', (req, res) => {
+  const id = String(req.params.id || '');
+  const account = findAccount(id) || loadAccounts().find((a) => String(a?.uid || '') === id);
+  if (!account) return res.status(404).json({ error: '账号不存在' });
+
+  const access = secretValue(account, 'access_token');
+  const refresh = secretValue(account, 'refresh_token');
+  res.json({
+    id: String(account.id || ''),
+    uid: String(account.uid || ''),
+    accessToken: typeof access === 'string' ? access : '',
+    refreshToken: typeof refresh === 'string' ? refresh : '',
+    expiresAt: Number(account.expiresAt) || 0,
+    refreshExpiresAt: Number(account.refreshExpiresAt) || 0,
+    refreshedAt: Number(account.refreshedAt) || 0,
+    /** 加密信封：access 取不出明文，界面要照实说，而不是显示空串 */
+    encrypted: isEnvelope(account.access_token),
+  });
 });
 
 /** 修改账号本地备注 / 展示名来源 */

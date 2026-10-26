@@ -1265,6 +1265,7 @@ function LanSyncSection() {
   const [info, setInfo] = useState<LanSyncStatus | null>(null);
   const [portDraft, setPortDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -1339,6 +1340,31 @@ function LanSyncSection() {
     }
   };
 
+  /**
+   * 重新读取局域网地址。
+   *
+   * 地址是服务端每次请求时现读网卡（os.networkInterfaces）得到的，不存在缓存；
+   * 但界面里的那份是挂载时取回来的——程序启动后换了 Wi-Fi、插拔了网线、
+   * 或 DHCP 重新分配了 IP，界面就会一直显示旧地址，手机按旧地址必然连不上。
+   * 所以这里给一个手动重取的入口，并明确告知地址到底是变了还是没变。
+   */
+  const refreshAddresses = async () => {
+    setRefreshing(true);
+    const before = (info?.addresses || []).map((a) => a.address).join(',');
+    try {
+      const r = await get<LanSyncStatus>('/api/lansync/status');
+      setInfo(r);
+      const after = (r.addresses || []).map((a) => a.address).join(',');
+      if (!after) toast('err', '没读到局域网地址，请确认电脑已连上 Wi-Fi');
+      else if (after !== before) toast('ok', '局域网地址已更新，请用新地址重新配对');
+      else toast('ok', '已刷新，地址没有变化');
+    } catch (e) {
+      toast('err', (e as Error).message);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   const shownPort = info?.listeningPort || info?.port;
 
   return (
@@ -1406,7 +1432,10 @@ function LanSyncSection() {
             </Button>
           </Row>
 
-          <Row label="手机该填的地址" desc="手机和电脑要在同一个 Wi-Fi 下（访客网络 / AP 隔离会连不通）。点一下复制。">
+          <Row
+            label="手机该填的地址"
+            desc="手机和电脑要在同一个 Wi-Fi 下（访客网络 / AP 隔离会连不通）。点一下复制；启动后换过 Wi-Fi、重连过网络，IP 会变，点「刷新地址」重新读取。"
+          >
             {info?.addresses?.length ? (
               info.addresses.map((a) => (
                 <button
@@ -1423,6 +1452,17 @@ function LanSyncSection() {
             ) : (
               <span className="text-xs text-zinc-400">没有检测到局域网地址（电脑可能没连网络）</span>
             )}
+            <Button
+              size="sm"
+              variant="subtle"
+              loading={refreshing}
+              disabled={loading}
+              onClick={refreshAddresses}
+              title="重新读取本机网卡地址，换网络后用它更新上面的 IP"
+            >
+              <IconRefresh className="w-3.5 h-3.5" />
+              刷新地址
+            </Button>
           </Row>
 
           <Row
