@@ -365,6 +365,40 @@ export interface AccountsResponse {
   variants: VariantInfo[];
 }
 
+/**
+ * 「重新获取已登录账号」的单档位结论（`POST /api/accounts/rescan`）。
+ *
+ * - `imported`：账号库里没有这个账号，本次新增；
+ * - `updated`：账号库里已有，本次刷新资料与凭据；
+ * - `none`：该档位没有可用的登录态（未登录 / 文件损坏 / 缺 uid），`ok=false` 但不是错误。
+ */
+export interface AccountRescanItem {
+  variant: string;
+  variantLabel: string;
+  authFilePath: string;
+  exists: boolean;
+  ok: boolean;
+  action: 'imported' | 'updated' | 'none';
+  uid: string | null;
+  account: AccountInfo | null;
+  /** 登录态只有加密信封、账号库里的明文凭据被保留时为 true */
+  keptPlainToken?: boolean;
+  /** 人话结论，前端直接拼提示 */
+  message: string;
+}
+
+export interface AccountsRescanResponse {
+  results: AccountRescanItem[];
+  accounts: AccountInfo[];
+  currents: {
+    cn: CurrentAccountState;
+    ai: CurrentAccountState;
+    active: string | null;
+  };
+  /** 本次读盘时刻 */
+  at: number;
+}
+
 /* ---------------- 会话（对话记录）复制 ---------------- */
 
 /** 会话列表里的一条：源是当前登录账号，目标是选中的账号 */

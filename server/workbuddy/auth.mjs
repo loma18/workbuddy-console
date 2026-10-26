@@ -12,7 +12,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { authFilePath, getVariant, variantOf } from './variant.mjs';
+import { authFilePath, getVariant, variantOf, VARIANT_LIST } from './variant.mjs';
 import {
   findAccount,
   loadAccounts,
@@ -362,6 +362,45 @@ export function detectCurrentAccount() {
 }
 
 /**
+ * 从登录态文件构造一条账号库记录（`importLocalAccount` 与 `rescanLoggedInAccounts` 共用）。
+ *
+ * token 有两种形态：明文（OAuth 所得）或 WorkBuddy 5.6 加密信封
+ * （`{$wbEncrypted: 1, envelope: '...'}`）。**信封必须原样保存**。
+ *
+ * 早先这里把非字符串一律降级成 `''`，于是「登录态文件只写信封」的档位
+ * （实测国际版 `workbuddy-desktop-ai.info` 的 accessToken / refreshToken 都是信封，
+ * 国内版升级后同样如此）导入后两个字段都是空串，`isEnvelope()` 也就判不出来——
+ * 界面直接落到「无可用凭据」，切换 / 刷新 / 查余额全部失效（2026-10-26 反馈）。
+ *
+ * 保留信封的语义：
+ * - `hasPlainToken()` 依旧为 false（确实取不出明文，发不出带鉴权的请求）；
+ * - `isEnvelope()` 为真 → 界面显示「加密凭据」而不是误报「无可用凭据」；
+ * - `switchAccount()` 可以原样写回登录态，切换功能可用。
+ */
+function recordFromAuthDoc(doc, variant, now = Date.now()) {
+  const uid = doc?.account?.uid;
+  const auth = doc.auth || {};
+  const keepSecret = (v) => (typeof v === 'string' && v.trim() ? v : isEnvelope(v) ? v : '');
+  return {
+    id: uid,
+    uid,
+    nickname: doc?.account?.nickname && !isEnvelope(doc.account.nickname) ? doc.account.nickname : '',
+    email: '',
+    domain: auth.domain || variant.apiEndpoint,
+    variant: variant.id,
+    access_token: keepSecret(auth.accessToken),
+    refresh_token: keepSecret(auth.refreshToken),
+    token_type: auth.tokenType || 'Bearer',
+    expiresAt: Number(auth.expiresAt) || (Number(auth.expiresIn) ? now + Number(auth.expiresIn) * 1000 : 0),
+    refreshExpiresAt: Number(auth.refreshExpiresAt) || 0,
+    refreshedAt: Number(auth.lastRefreshTime) || now,
+    createdAt: now,
+    profile_raw: doc?.account || {},
+    auth_raw: { auth: auth },
+  };
+}
+
+/**
  * 从登录态文件导入本机当前账号到账号库（去重：uid 已存在则覆盖 token）。
  */
 export function importLocalAccount(variantId = 'cn') {
@@ -372,43 +411,8 @@ export function importLocalAccount(variantId = 'cn') {
   const uid = doc?.account?.uid;
   if (!uid) throw new Error('登录态文件中没有账号标识（uid），无法导入');
 
-  const auth = doc.auth || {};
-  const accessToken = auth.accessToken;
-  /**
-   * token 有两种形态：明文（OAuth 所得）或 WorkBuddy 5.6 加密信封
-   * （`{$wbEncrypted: 1, envelope: '...'}`）。**信封必须原样保存**。
-   *
-   * 早先这里把非字符串一律降级成 `''`，于是「登录态文件只写信封」的档位
-   * （实测国际版 `workbuddy-desktop-ai.info` 的 accessToken / refreshToken 都是信封，
-   * 国内版升级后同样如此）导入后两个字段都是空串，`isEnvelope()` 也就判不出来——
-   * 界面直接落到「无可用凭据」，切换 / 刷新 / 查余额全部失效（2026-10-26 反馈）。
-   *
-   * 保留信封的语义：
-   * - `hasPlainToken()` 依旧为 false（确实取不出明文，发不出带鉴权的请求）；
-   * - `isEnvelope()` 为真 → 界面显示「加密凭据」而不是误报「无可用凭据」；
-   * - `switchAccount()` 可以原样写回登录态，切换功能可用。
-   */
-  const keepSecret = (v) => (typeof v === 'string' && v.trim() ? v : isEnvelope(v) ? v : '');
-  const storedAccess = keepSecret(accessToken);
-
   const now = Date.now();
-  const record = {
-    id: uid,
-    uid,
-    nickname: doc?.account?.nickname && !isEnvelope(doc.account.nickname) ? doc.account.nickname : '',
-    email: '',
-    domain: auth.domain || variant.apiEndpoint,
-    variant: variant.id,
-    access_token: storedAccess,
-    refresh_token: keepSecret(auth.refreshToken),
-    token_type: auth.tokenType || 'Bearer',
-    expiresAt: Number(auth.expiresAt) || (Number(auth.expiresIn) ? now + Number(auth.expiresIn) * 1000 : 0),
-    refreshExpiresAt: Number(auth.refreshExpiresAt) || 0,
-    refreshedAt: Number(auth.lastRefreshTime) || now,
-    createdAt: now,
-    profile_raw: doc?.account || {},
-    auth_raw: { auth: auth },
-  };
+  const record = recordFromAuthDoc(doc, variant, now);
 
   const accounts = loadAccounts();
   const idx = accounts.findIndex((a) => a?.uid === uid);
@@ -423,6 +427,150 @@ export function importLocalAccount(variantId = 'cn') {
   }
   saveAccounts(accounts);
   return accountMeta(record);
+}
+
+/** 凭据字段是否是"能直接放进 Authorization 头"的明文字符串 */
+function isPlainSecret(value) {
+  return typeof value === 'string' && !!value.trim();
+}
+
+/**
+ * 把重新读到的登录态合并进账号库里已有的一条记录。
+ *
+ * 与 `importLocalAccount` 的差异（这也是不能直接复用它做"重新获取"的原因）：
+ * 1. **不拿加密信封覆盖明文凭据**。扫码入库的账号是明文 token（能验活 / 查余额），
+ *    而客户端写登录态时经常只写信封；无脑覆盖会让一个能用的账号退化成「加密凭据」。
+ * 2. 登录态文件里取不到的信息（备注、展示名来源、邮箱、企业名）一律保留本地值，
+ *    不能被空串抹掉——重新获取账号不该丢用户手填的东西。
+ */
+function mergeRescannedRecord(prev, fresh, now = Date.now()) {
+  const merged = { ...prev, ...fresh };
+  // 本地字段：登录态文件里没有这些，必须回填
+  merged.note = prev.note;
+  merged.displayField = prev.displayField;
+  merged.createdAt = prev.createdAt || now;
+  if (!merged.email) merged.email = prev.email || '';
+  if (!merged.enterpriseName) merged.enterpriseName = prev.enterpriseName;
+
+  const prevAccess = secretValue(prev, 'access_token');
+  const fileAccess = secretValue(fresh, 'access_token');
+  const keptPlainToken = isPlainSecret(prevAccess) && !isPlainSecret(fileAccess);
+  if (keptPlainToken) {
+    // 文件只有信封（或空）：凭据与到期时间整套沿用库里那份明文
+    merged.access_token = prev.access_token;
+    merged.refresh_token = prev.refresh_token;
+    merged.token_type = prev.token_type || merged.token_type;
+    merged.expiresAt = prev.expiresAt;
+    merged.refreshExpiresAt = prev.refreshExpiresAt;
+    merged.refreshedAt = prev.refreshedAt;
+  } else {
+    // 文件里是明文（或库里本来也没有明文）：以文件为准，但空值不覆盖已有值
+    if (!merged.access_token) merged.access_token = prev.access_token;
+    if (!merged.refresh_token) merged.refresh_token = prev.refresh_token;
+  }
+  return { record: merged, keptPlainToken };
+}
+
+/**
+ * 重新获取**两档**当前已登录的账号，并同步进账号库。
+ *
+ * ## 为什么需要这个动作（2026-10-26 反馈）
+ *
+ * 用户可能在 `WorkBuddy` / `WorkBuddy AI` 客户端里直接换了账号（登出再登入），
+ * 或者手动替换了登录态文件。此时登录态文件已经指向新账号，但账号库里没有它，
+ * 「当前登录态」一栏只能显示"尚未导入"，界面上也就拿不到最新登录的那个账号。
+ *
+ * 这里强制重新读盘（不做任何缓存），逐档给出结论：
+ * - `imported`：账号库里没有 → 新增；
+ * - `updated`：账号库里已有 → 刷新资料与凭据；
+ * - `none`：该档位没有登录态（或文件损坏 / 缺 uid），不算失败，只说明情况。
+ *
+ * 只读登录态文件、只写账号库，**绝不改动登录态文件本身**——重新获取账号不该影响
+ * 客户端当前登录的是谁。
+ */
+export function rescanLoggedInAccounts() {
+  const now = Date.now();
+  const accounts = loadAccounts();
+  const results = [];
+  let dirty = false;
+
+  for (const variant of VARIANT_LIST) {
+    const base = {
+      variant: variant.id,
+      variantLabel: variant.label,
+      authFilePath: authFilePath(variant.id),
+    };
+    const doc = readAuthFile(variant.id);
+    if (!doc) {
+      results.push({
+        ...base,
+        exists: false,
+        ok: false,
+        action: 'none',
+        uid: null,
+        account: null,
+        message: '没有登录态文件（该档位未登录，或文件已损坏）',
+      });
+      continue;
+    }
+    // 老版本登录态可能没有 account.uid，退回 sessionState（与 detectCurrentAccountForVariant 同口径）
+    const uid = doc?.account?.uid || doc?.auth?.sessionState || null;
+    if (!uid) {
+      results.push({
+        ...base,
+        exists: true,
+        ok: false,
+        action: 'none',
+        uid: null,
+        account: null,
+        message: '登录态里没有账号标识（uid），无法识别账号',
+      });
+      continue;
+    }
+
+    const fresh = recordFromAuthDoc(doc, variant, now);
+    const idx = accounts.findIndex((a) => String(a?.uid || '') === String(uid));
+    if (idx < 0) {
+      accounts.push(fresh);
+      dirty = true;
+      results.push({
+        ...base,
+        exists: true,
+        ok: true,
+        action: 'imported',
+        uid: String(uid),
+        account: accountMeta(fresh),
+        message: `新增「${accountDisplayName(fresh)}」到账号库`,
+      });
+      continue;
+    }
+
+    const { record: merged, keptPlainToken } = mergeRescannedRecord(accounts[idx], fresh, now);
+    accounts[idx] = merged;
+    dirty = true;
+    const name = accountDisplayName(merged);
+    results.push({
+      ...base,
+      exists: true,
+      ok: true,
+      action: 'updated',
+      uid: String(uid),
+      account: accountMeta(merged),
+      keptPlainToken,
+      message: keptPlainToken
+        ? `已刷新「${name}」的资料；登录态是加密凭据，账号库里的明文凭据已保留`
+        : `已更新「${name}」的凭据与资料`,
+    });
+  }
+
+  if (dirty) saveAccounts(accounts);
+
+  return {
+    results,
+    accounts: accounts.map((a) => accountMeta(a)),
+    currents: detectCurrentAccounts(),
+    at: now,
+  };
 }
 
 /** 删除账号（按 id）。当前登录中的账号不允许删，避免把用户锁在门外。 */

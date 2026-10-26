@@ -34,6 +34,7 @@ import {
   detectCurrentAccount,
   detectCurrentAccounts,
   importLocalAccount,
+  rescanLoggedInAccounts,
   deleteAccount,
   updateAccountDisplay,
 } from './workbuddy/auth.mjs';
@@ -740,6 +741,22 @@ app.post(
   wrap(async (req, res) => {
     const variant = String(req.body?.variant || 'cn');
     res.json(importLocalAccount(variant));
+  })
+);
+
+/**
+ * 重新获取**两档**已登录账号：强制重新读盘，把当前登录的账号同步进账号库。
+ *
+ * 使用场景：用户在客户端里直接换了账号（登出再登入）或手动替换了登录态文件，
+ * 账号库不会自己知道，界面也就"看不到最新登录的那个账号"。这里一次读两档、
+ * 逐档给结论（新增 / 更新 / 该档没登录），前端据此提示并刷新列表。
+ *
+ * 只读登录态文件、只写账号库：不会改动任何一档的登录态。
+ */
+app.post(
+  '/api/accounts/rescan',
+  wrap(async (req, res) => {
+    res.json(rescanLoggedInAccounts());
   })
 );
 

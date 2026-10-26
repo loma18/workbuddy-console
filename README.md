@@ -59,7 +59,7 @@ npm run test:proxy   # 其余测试脚本见下文各节
 
 | 页面 | 说明 |
 | --- | --- |
-| **账号管理** | 扫码添加（OAuth 设备码，二维码本地渲染、服务端常驻采集）、导入本机登录态、**切换账号**（**自动结束 WorkBuddy 后台进程** → 备份 + 原子写入 + 失败回滚 → **自动重新打开**）、**刷新凭据**（用 refresh_token 换新的 access_token）、**会话复制**（把当前账号的对话按新会话 id 复制给目标账号，切换时可勾选一并执行）、备注、删除；顶部标明当前登录态与 WorkBuddy 运行状态 |
+| **账号管理** | 扫码添加（OAuth 设备码，二维码本地渲染、服务端常驻采集）、导入本机登录态、**重新获取已登录账号**（一次重读国内版 + 国际版登录态，把客户端里手动换过的账号同步进账号库）、**切换账号**（**自动结束 WorkBuddy 后台进程** → 备份 + 原子写入 + 失败回滚 → **自动重新打开**）、**刷新凭据**（用 refresh_token 换新的 access_token）、**会话复制**（把当前账号的对话按新会话 id 复制给目标账号，切换时可勾选一并执行）、备注、删除；顶部标明当前登录态与 WorkBuddy 运行状态 |
 | **免费模型广场** | 三个子页签合并在一个入口：**免费模型**（只看各平台免费模型，搜索 + 排序，一键写入 `models.json` 或导出给其他 agent）、**平台额度**（各平台 Key 的免费额度与余额）、**API Keys**（多 Key 轮换、测试、设为活跃）+ 模型列表缓存管理 |
 | **反向代理** | 把 WorkBuddy 的官方对话能力**按四种主流协议**暴露给本机 agent：OpenAI Chat Completions（`/v1/chat/completions`）、Anthropic Messages（`/v1/messages`）、OpenAI Responses（`/v1/responses`）、Google Gemini 原生（`/v1beta/models/{model}:generateContent`）；账号池轮询、401 自动刷新 token 并换号、流式/非流式都支持（上游只收流式，非流式由代理聚合）；按协议族分组的接入示例（Claude Code / Codex CLI / Gemini CLI / Cherry Studio / Cline / Cursor / TRAE / 小米 MiMo / 豆包 等）、请求日志与连通性自检；默认关闭，需在页面显式开启 |
 | **Token 统计** | 扫描本机会话日志（JSONL），统计请求数、输入/输出/缓存读写/思考 Token、缓存命中率、模型与项目排行、会话明细；**按档位（国内版 / 国际版）分别归档**，可选「全部档位」合并查看 |

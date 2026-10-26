@@ -258,6 +258,33 @@ function resolveNames({ names, variant } = {}) {
   return WORKBUDDY_PROCESS_NAMES;
 }
 
+/** 去掉 `.exe` 并转小写：比较映像名时统一口径 */
+function bareName(name) {
+  return String(name || '')
+    .replace(/\.exe$/i, '')
+    .toLowerCase();
+}
+
+/** 正则转义：进程名会被拼进 RegExp */
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 本次要动的映像名集合（小写、去 `.exe`）。
+ *
+ * 枚举结果一律按它**精确**过滤，确保「切国内版只动国内版」不是靠调用方自觉：
+ * `WorkBuddy` 与 `WorkBuddyAI` 是两个客户端，任何前缀/子串匹配都会把另一档卷进来。
+ */
+function nameSet(names) {
+  return new Set(names.map(bareName).filter(Boolean));
+}
+
+/** 该进程是不是本次目标档位自己的进程（按映像名精确比对） */
+function isOwnVariantProcess(row, allowed) {
+  const n = bareName(row?.name);
+  return !!n && allowed.has(n);
+}
 
 /** 解析 PowerShell 序列化的启动时间：PS 5.1 为 "/Date(ms)/"，PS 7 为 ISO 字符串 */
 function parseStartTime(v) {
@@ -298,13 +325,20 @@ async function runPowerShell(args, timeoutMs = 15000) {
 /**
  * Windows 主路径：枚举**全部**匹配进程，按启动时间升序。
  * 对默认进程名来说，第一个就是主进程（Electron 的渲染/GPU/工具进程都是它的子进程）。
+ *
+ * 脚本刻意写成 `@(...)` + 显式 `'[]'` 分支，而**不是**直接管道 `ConvertTo-Json`：
+ * 没有匹配进程时，`Get-Process -Name X` 会把 `$?` 置为 false，PowerShell 于是以**退出码 1**
+ * 结束（stdout 为空、stderr 也被 SilentlyContinue 吞掉）。`run()` 见非 0 即 reject，
+ * 调用方只能判定"PowerShell 不可用"并降级到 tasklist —— 明明只是"没有进程"，却白白多跑一趟
+ * 更慢的 tasklist，还附送一句"已改用 tasklist 完成检测"的误导性 warning。
+ * 现在无匹配恒输出 `[]`、退出码恒为 0，"空结果"与"探测失败"彻底分开。
  */
 async function listViaPowerShell(names = WORKBUDDY_PROCESS_NAMES) {
   // 不用 Sort-Object StartTime：个别进程取不到 StartTime 时会让整条管道报错，
   // 改为取回全部进程后在 JS 里排序。
   const ps =
-    `Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue | ` +
-    `Select-Object Id,ProcessName,Path,StartTime | ConvertTo-Json -Compress`;
+    `$ErrorActionPreference='Stop'; $p = @(Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue); ` +
+    `if ($p.Count -gt 0) { $p | Select-Object Id,ProcessName,Path,StartTime | ConvertTo-Json -Compress } else { '[]' }`;
   const stdout = await runPowerShell(['-NoProfile', '-NonInteractive', '-Command', ps], 15000);
   const t = stdout.trim();
   if (!t) return [];
@@ -427,6 +461,9 @@ export function parsePsProcessTable(stdout) {
  *    切号时把自己杀掉 → macOS 弹「意外退出」（macOS 用户实测 2026-10-17）。
  *    Windows 分支无此问题：那里的匹配按映像名**精确**匹配。
  * 2) 按名称模式匹配命令行（大小写不敏感）；
+ *    ⚠️ 映像名后面必须**不是**字母数字：`WorkBuddy` 不能匹配 `WorkBuddyAI`（另一档客户端），
+ *    但要继续匹配 `WorkBuddy Helper` 与 `WorkBuddy.app/Contents/MacOS/WorkBuddy`。
+ *    早先是纯子串匹配，两档同时登录时国际版会被算进国内版的进程表（跨档误杀/误判）。
  * 3) 按启动时间升序：最早 = 主进程，先杀主进程，Electron 子进程随之退出；
  *    反过来先强杀 helper 会触发主进程 Chromium CHECK 失败（SIGTRAP）→ 真正的 WorkBuddy「意外退出」。
  */
@@ -440,7 +477,7 @@ export function selectWorkbuddyRows(rows, names = WORKBUDDY_PROCESS_NAMES) {
       grew = true;
     }
   }
-  const pattern = new RegExp(`(${names.map((n) => n.replace(/\.exe$/i, '')).join('|')})`, 'i');
+  const pattern = new RegExp(`(${names.map((n) => escapeRegExp(n.replace(/\.exe$/i, ''))).join('|')})(?![\\w])`, 'i');
   return rows
     .filter((r) => !own.has(r.pid) && pattern.test(r.command))
     .map((r) => {
@@ -606,45 +643,125 @@ export async function listWorkbuddyProcesses({ names, variant } = {}) {
   }
 }
 
-/** 轮询等待进程消失 */
-async function waitUntilGone(timeoutMs, names) {
-  const deadline = Date.now() + timeoutMs;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 轮询直到 `predicate()` 返回 true 或超时；返回是否在超时前达成。
+ *
+ * 等待"进程真的没了"必须用它 + 便宜的探测，**不能**每次都用全量枚举：
+ * 一次 `Get-Process … | ConvertTo-Json` 在慢机器上要好几秒（沙箱里实测 4~5s），
+ * 拿它当 400ms 轮询的探针，一轮就把整个超时预算吃光了 —— 于是"刚杀完、还没确认"
+ * 就被判成"退不掉"，报出「无法退出 WorkBuddy（仍在运行）」的假失败。
+ */
+async function waitUntil(predicate, timeoutMs, stepMs = 350) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
   for (;;) {
-    const { processes, error } = await listWorkbuddyProcesses({ names });
-    if (!processes.length) return { gone: true, unconfirmed: !!error };
-    if (Date.now() >= deadline) return { gone: false, remaining: processes };
-    await new Promise((r) => setTimeout(r, 400));
+    if (await predicate()) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await sleep(Math.min(stepMs, left));
   }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/**
+ * 轻量存活探测：只回答"还有没有**本档位**进程"，不要求 PID、启动时间。
+ *
+ * Windows 走 tasklist（`IMAGENAME eq` 精确匹配，比 PowerShell 快得多，也不会把
+ * `WorkBuddyAI` 算进来）；tasklist 不可用时退回全量枚举——**宁可慢，也不能瞎猜**：
+ * 把"探测失败"当成"没有进程"会让切号在客户端还活着时继续写登录态，那才是真正会丢数据的方向。
+ *
+ * macOS / Linux 直接复用 ps 全量枚举（那边 ps 本来就快）。
+ */
+export async function anyWorkbuddyProcess({ names, variant } = {}) {
+  const procs = resolveNames({ names, variant });
+  const allowed = nameSet(procs);
+  const mine = (p) => p.pid !== process.pid && isOwnVariantProcess(p, allowed);
+
+  if (process.platform === 'win32') {
+    try {
+      for (const name of procs) {
+        const exe = /\.exe$/i.test(name) ? name : `${name}.exe`;
+        const stdout = await run('tasklist', ['/FI', `IMAGENAME eq ${exe}`, '/FO', 'CSV', '/NH'], 8000);
+        for (const line of String(stdout)
+          .split('\n')
+          .map((s) => s.trim())) {
+          // 无匹配时 tasklist 打印 "INFO: No tasks are running…"，不含 exe 名
+          if (!line.toLowerCase().includes(exe.toLowerCase())) continue;
+          const pid = Number(line.split('","').map((s) => s.replace(/^"|"$/g, ''))[1]);
+          if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) return true;
+        }
+      }
+      return false;
+    } catch {
+      /* tasklist 不可用（被安全策略拦掉等）：退回全量枚举，结论依旧可信 */
+    }
+  }
+
+  const { processes, error } = await listWorkbuddyProcesses({ names: procs });
+  if (error) throw new Error(error);
+  return processes.some(mine);
+}
 
 /** 优雅退出的等待窗口：够 WM_CLOSE 走完，又不至于让界面等太久 */
 const STOP_GRACEFUL_MS = 2500;
 /** 强杀后的等待上限 */
 const STOP_FORCE_MS = 12000;
+/** 强杀每一轮里"等它死"的窗口：短一点，确认不了就重新枚举再来一轮（新冒出来的 helper 也能被清掉） */
+const FORCE_ROUND_WAIT_MS = 2500;
 
-/** 给单个 PID 发终止信号（win32 走 taskkill，其他平台走 kill） */
-function terminatePid(pid, force) {
+/**
+ * 给单个 PID 发终止信号（win32 走 taskkill，其他平台走 kill）。
+ *
+ * `tree` 只在"尽力把整棵进程树一起带走"时才开：`/T` 的语义是**连子孙一起杀，
+ * 且任何一个子孙杀不掉就拒绝杀父进程**。WorkBuddy 5.9 的 agent 会话会在客户端下面挂
+ * 沙箱化的 shell / MCP 子进程，那些进程外部杀不掉，于是 `/T` 每次都失败、客户端反而
+ * 活得好好的（2026-10-26「两档同时登录时切号必然失败」的真因）。
+ * 所以强杀路径**必须**同时有一个不带 `/T` 的兜底：只按映像名杀本档位自己的进程。
+ *
+ * 失败不抛错（单个进程杀不掉不该中断整轮清理），但要如实返回结果 ——
+ * 早先这里 `run(...).catch(() => {})` 之后才挂调试日志，catch 已经把 rejection 吃掉，
+ * 日志于是**永远**打印 ok，把真正的失败藏了起来。
+ */
+function terminatePid(pid, force, { tree = false } = {}) {
   const args =
     process.platform === 'win32'
-      ? ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])]
+      ? ['/PID', String(pid), ...(tree ? ['/T'] : []), ...(force ? ['/F'] : [])]
       : [force ? '-KILL' : '-TERM', String(pid)];
-  // 单个进程杀不掉不影响其余：主进程一死，它的子进程通常已经一起没了
-  return run(process.platform === 'win32' ? 'taskkill' : 'kill', args).catch(() => {});
+  return run(process.platform === 'win32' ? 'taskkill' : 'kill', args)
+    .then(() => ({ ok: true }))
+    .catch((err) => ({ ok: false, error: shortExecError(err) }))
+    .then((r) => {
+      if (process.env.WB_DEBUG_STOP === '1') {
+        console.log(`[stop] kill ${r.ok ? 'ok' : 'FAIL'} ${pid} ${args.join(' ')}${r.ok ? '' : ` (${r.error})`}`);
+      }
+      return r;
+    });
 }
 
 /**
  * 退出**某一档**客户端（该档的全部相关进程），并**确认真的消失了**才返回。
  *
- * 两步走：先 `taskkill`（不带 `/F`，向窗口发 WM_CLOSE，能保住正在落盘的数据），
- * 等不到就逐个 `/T /F` 强杀。第二步不是多余的——WorkBuddy 关窗会缩到系统托盘，
+ * 两步走：先优雅关闭（向主窗口发 WM_CLOSE，能保住正在落盘的数据），
+ * 等不到就强杀。第二步不是多余的——WorkBuddy 关窗会缩到系统托盘，
  * 优雅退出经常"看起来关掉了其实还活着"，那样切号会被它把登录态改写回去。
  *
  * **每轮都重新枚举再杀**，而不是开局枚举一次就照着那份 PID 名单猛敲：
  * 一来 tasklist 兜底时一次只能看到部分 PID、连主进程是谁都分不出；
  * 二来先杀 helper 会被主进程立刻重新拉起来。反复枚举能让名单自然收敛
  * （先冒出来的子进程被清掉 → 主进程暴露出来 → 再清掉它），直到进程表真的空了。
+ *
+ * ## 强杀为什么是"先按树、再逐个"（2026-10-26 修复）
+ *
+ * 只按树杀（`/T /F`）会被客户端下面的 agent 会话子进程拖死：`taskkill /T` 要求整棵树
+ * 都能杀，只要有一个沙箱化子进程拒绝终止，它就**连父进程一起放弃**——于是客户端还在、
+ * 界面报「无法退出 WorkBuddy（仍在运行：PID …）」，用户只能手动退出后重试。
+ * 现在的做法是：先尽力按树杀（正常情况一次带走全部 helper 与 agent 子进程），
+ * 再对枚举到的每个进程逐个 `/F`（不带 `/T`）。逐个杀只依赖"映像名属于本档位"，
+ * 不会被任何子孙拖累，因此**本档位自己的进程一定死得掉**。
+ *
+ * 同一轮修复还顺手换掉了等待方式：确认"真的没了"改用 tasklist / ps 的**轻量探针**，
+ * 而不是每 400ms 起一个 PowerShell 做全量枚举（慢机器上单次 4~5 秒，一轮就吃光超时预算，
+ * 于是刚杀干净也会误报「仍在运行」）。详见 {@link waitUntil} 与 {@link anyWorkbuddyProcess}。
  *
  * `variant` 决定动哪一档：`'cn'` 只动国内版、`'ai'` 只动国际版、`'all'` 两档都动。
  * 不传则沿用历史默认（国内版）。切号必须显式传目标账号所属档位——两档是两个客户端，
@@ -659,46 +776,84 @@ export async function stopWorkbuddy({
   forceMs = STOP_FORCE_MS,
 } = {}) {
   const procs = resolveNames({ names, variant });
+  const allowed = nameSet(procs);
   const label = variant && String(variant) !== 'all' ? appLabelOf(variant) : 'WorkBuddy';
-  const first = await listWorkbuddyProcesses({ names: procs });
-  if (first.error) {
-    throw new Error(`无法确认 ${label} 的运行状态（${first.error}），为安全起见没有结束任何进程`);
-  }
-  if (!first.processes.length) {
-    return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null, variant: variant || null };
-  }
-
-  const exePath = first.processes.find((p) => p.exePath)?.exePath || null;
-  const killed = new Set();
 
   /**
-   * 一轮"枚举 → 全杀 → 轮询到消失或超时"。
-   * 探测失败时抛错而不是当作"已经关掉了"——那会让切号在客户端还活着的情况下继续。
+   * 枚举本档位自己的进程：按映像名**精确**过滤（不靠调用方自觉），并排除控制台自己——
+   * 控制台被用户从 WorkBuddy 里拉起时就是客户端的子进程，误杀自己等于切换当场中断。
    */
-  const round = async (force, timeoutMs) => {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const { processes, error } = await listWorkbuddyProcesses({ names: procs });
-      if (error) throw new Error(`无法确认 ${label} 是否已退出（${error}），已中止`);
-      if (!processes.length) return true;
-      for (const p of processes) killed.add(p.pid);
-      for (const p of processes) await terminatePid(p.pid, force);
-      if (Date.now() >= deadline) return false;
-      await sleep(400);
+  const enumerate = async () => {
+    const { processes, error } = await listWorkbuddyProcesses({ names: procs });
+    if (error) throw new Error(`无法确认 ${label} 是否已退出（${error}），已中止`);
+    return processes.filter((p) => p.pid !== process.pid && isOwnVariantProcess(p, allowed));
+  };
+
+  /**
+   * 便宜的"还在不在"探针（tasklist / ps），只用于等待窗口内的轮询。
+   * 探测本身失败时抛错 —— 调用方绝不能把"不知道"当成"已经没了"。
+   */
+  const alive = async () => {
+    try {
+      return await anyWorkbuddyProcess({ names: procs });
+    } catch (err) {
+      throw new Error(`无法确认 ${label} 是否已退出（${err?.message || err}），已中止`);
     }
   };
 
-  if (await round(false, gracefulMs)) {
+  const first = await enumerate();
+  if (!first.length) {
+    return { stopped: true, wasRunning: false, killed: [], forced: false, exePath: null, variant: variant || null };
+  }
+
+  const exePath = first.find((p) => p.exePath)?.exePath || null;
+  const killed = new Set();
+
+  /** 优雅关闭只针对主进程（最早启动的那个）：/T 会把整棵树都关一遍，而 agent 子进程根本不吃 WM_CLOSE */
+  const mainPid = first[0].pid;
+  killed.add(mainPid);
+  await terminatePid(mainPid, false);
+  if (await waitUntil(async () => !(await alive()), gracefulMs)) {
+    // 进程刚没，让 SQLite 把 -wal/-shm 的句柄彻底放开，再动数据库
+    await sleep(700);
     return { stopped: true, wasRunning: true, killed: [...killed], forced: false, exePath, variant: variant || null };
   }
 
-  if (!(await round(true, forceMs))) {
-    throw new Error(`无法退出 ${label}（仍在运行：PID ${[...killed].join(', ')}），请手动退出后重试`);
+  /**
+   * 强杀：每轮「尽力按树杀 + 逐个兜底杀」，直到进程表真的空了。
+   *
+   * 判定"空了"用**便宜的探针**而不是再枚举一次：枚举要起一个 PowerShell，慢机器上单次要
+   * 4~5 秒，拿它当轮询探针的话，一轮就把 forceMs 预算耗尽，于是明明刚杀干净也会报
+   * 「仍在运行」的假失败（2026-10-26 实测踩到，日志里 deadline 直接是负数）。
+   * 每轮的等待只给一小段（`FORCE_ROUND_WAIT_MS`），确认不了就重新枚举再来一轮——
+   * 这样"杀完之后主进程又拉起新的 helper"也能被下一轮清掉。
+   * 只有预算真的耗尽才抛错，抛之前再枚举一次，好给出**准确**的残留 PID 供用户手动处理。
+   */
+  const forceDeadline = Date.now() + forceMs;
+  let rows = first;
+  for (;;) {
+    if (!rows.length) break;
+    for (const p of rows) killed.add(p.pid);
+    await terminatePid(rows[0].pid, true, { tree: true });
+    for (const p of rows) await terminatePid(p.pid, true);
+
+    const budget = forceDeadline - Date.now();
+    if (budget > 0 && (await waitUntil(async () => !(await alive()), Math.min(budget, FORCE_ROUND_WAIT_MS)))) break;
+
+    // 还没确认干净：重新枚举（可能冒出了新的 helper；也可能刚好已经退了）
+    rows = await enumerate().catch(() => rows);
+    if (!rows.length) break;
+    if (Date.now() >= forceDeadline) {
+      throw new Error(
+        `无法退出 ${label}（仍在运行：${rows.map((p) => `${p.name}:${p.pid}`).join(', ')}），请手动退出后重试`
+      );
+    }
   }
+
   // 进程刚没，让 SQLite 把 -wal/-shm 的句柄彻底放开，再动数据库
   await sleep(700);
-  const confirm = await waitUntilGone(1000, procs);
-  if (!confirm.gone) throw new Error(`${label} 退出后又重新启动，请手动退出后重试`);
+  const confirm = await enumerate().catch(() => []);
+  if (confirm.length) throw new Error(`${label} 退出后又重新启动，请手动退出后重试`);
   return { stopped: true, wasRunning: true, killed: [...killed], forced: true, exePath, variant: variant || null };
 }
 
@@ -752,15 +907,24 @@ function findWorkbuddyAppBundle(exePath, variant = 'cn') {
   });
 }
 
+/**
+ * 重启**指定档位**的客户端（模型配置变更后让 models.json 生效）。
+ *
+ * 退出这一步**必须**复用 {@link stopWorkbuddy}：早先这里自己拼了一条
+ * `taskkill /PID <主进程> /T /F`，和切号踩的是同一个坑——`/T` 要求整棵树都能杀，
+ * 只要客户端下面挂着杀不掉的 agent 子进程，它就拒绝杀父进程，重启于是变成"又开一个"。
+ * 复用之后：先按树、再逐个 `/F`，并且**确认真的退出了**才拉起新的。
+ */
 export async function restartWorkbuddy({ variant = 'cn' } = {}) {
   const label = appLabelOf(variant);
   const proc = await detectWorkbuddyProcess({ variant });
   if (!proc.running) throw new Error(`未检测到运行中的 ${label} 进程，无需重启（下次启动自动生效）`);
+
+  const stopped = await stopWorkbuddy({ variant });
+  await new Promise((r) => setTimeout(r, 1200));
+
   if (process.platform === 'win32') {
-    if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');
-    await run('taskkill', ['/PID', String(proc.pid), '/T', '/F'], 10000);
-    await new Promise((r) => setTimeout(r, 1500));
-    const exe = findWorkbuddyExe(proc.exePath, variant);
+    const exe = findWorkbuddyExe(stopped.exePath || proc.exePath, variant);
     if (!exe) {
       throw new Error(
         `未能定位 ${label} 可执行文件，请手动重新打开 ${label}。` +
@@ -772,10 +936,7 @@ export async function restartWorkbuddy({ variant = 'cn' } = {}) {
     return { restarted: true, exePath: exe };
   }
   if (process.platform === 'darwin') {
-    if (!proc.pid) throw new Error('未获取到进程 ID，无法重启');
-    await terminatePid(proc.pid, true);
-    await new Promise((r) => setTimeout(r, 1500));
-    const bundle = findWorkbuddyAppBundle(proc.exePath, variant);
+    const bundle = findWorkbuddyAppBundle(stopped.exePath || proc.exePath, variant);
     if (!bundle) {
       throw new Error(`未能定位 ${label} 的 .app 包，请手动重新打开 ${label}`);
     }

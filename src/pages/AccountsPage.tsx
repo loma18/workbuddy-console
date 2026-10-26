@@ -39,6 +39,7 @@ import type {
   AccountCredential,
   AccountInfo,
   AccountRefreshRunResponse,
+  AccountsRescanResponse,
   AccountsResponse,
   AppStopResult,
   CreditBalance,
@@ -1802,6 +1803,8 @@ export default function AccountsPage() {
   const [wbRunning, setWbRunning] = useState(false);
   /** 「退出 WorkBuddy」按钮的进行态 */
   const [stopping, setStopping] = useState(false);
+  /** 「重新获取已登录账号」的进行态：强制重读国内版 + 国际版的登录态 */
+  const [rescanning, setRescanning] = useState(false);
   /** 会话复制弹窗的目标账号；`sessionMode` 决定按钮是「开始复制」还是「复制并切换」 */
   const [sessionTarget, setSessionTarget] = useState<AccountInfo | null>(null);
   const [sessionMode, setSessionMode] = useState<'copy' | 'switch'>('copy');
@@ -2140,6 +2143,36 @@ export default function AccountsPage() {
     }
   };
 
+  /**
+   * 重新获取已登录账号：**两档一次读完**，强制重新读盘并同步进账号库。
+   *
+   * 为什么需要它：用户可能在 `WorkBuddy` / `WorkBuddy AI` 客户端里直接换了账号，
+   * 或者手动替换了登录态文件——账号库不会自己知道，页面就只能停在旧账号 / "尚未导入"。
+   * 这个动作读的是两档各自的登录态文件（国内版 `workbuddy-desktop.info`、
+   * 国际版 `workbuddy-desktop-ai.info`），把最新登录的账号补进库或刷新一遍。
+   *
+   * 只读登录态、只写账号库：不会改变任何一档客户端当前登录的是谁。
+   * 逐档的结论由服务端给（新增 / 更新 / 该档没登录），这里原样拼进提示，
+   * 避免"点了一下什么都没发生"。
+   */
+  const rescanLoggedIn = async () => {
+    setRescanning(true);
+    try {
+      const r = await post<AccountsRescanResponse>('/api/accounts/rescan', {});
+      const list = r.results || [];
+      const detail = list.map((x) => `${x.variantLabel}：${x.message}`).join('；');
+      toast(list.some((x) => x.ok) ? 'ok' : 'info', detail || '没有读到任何登录态');
+      await load();
+      void loadBalances(true);
+      // 客户端可能刚被换过账号（甚至重启过），运行状态重新探一次
+      loadWb();
+    } catch (e: any) {
+      toast('err', e?.message || '重新获取已登录账号失败');
+    } finally {
+      setRescanning(false);
+    }
+  };
+
   const balanceOf = useCallback(
     (id: string): CreditBalance | null => balances?.accounts?.find((r) => r.accountId === id)?.balance ?? null,
     [balances]
@@ -2289,16 +2322,29 @@ export default function AccountsPage() {
           title="当前登录态"
           desc="切换账号会重写该档位客户端的登录态文件，操作前自动备份，失败自动回滚"
           actions={
-            <Button
-              size="sm"
-              onClick={() => {
-                load();
-                void loadBalances(true);
-              }}
-            >
-              <IconRefresh className="w-3.5 h-3.5" />
-              刷新
-            </Button>
+            <>
+              {/* 在客户端里手动换了账号（或替换了登录态文件）时，账号库不会自己知道——
+                  这个按钮强制重读两档登录态，把最新登录的账号补进库 / 刷新资料 */}
+              <Button
+                size="sm"
+                loading={rescanning}
+                onClick={() => void rescanLoggedIn()}
+                title="重新读取国内版与国际版的登录态文件，把当前登录的账号补进账号库（只读登录态，不改动任何一档客户端）"
+              >
+                <IconArrowDown className="w-3.5 h-3.5" />
+                重新获取已登录账号
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => {
+                  load();
+                  void loadBalances(true);
+                }}
+              >
+                <IconRefresh className="w-3.5 h-3.5" />
+                刷新
+              </Button>
+            </>
           }
         />
         <div className="mt-4 space-y-4">
@@ -2333,7 +2379,7 @@ export default function AccountsPage() {
                       <div className="font-medium text-zinc-500">{label}：未登录</div>
                       <div className="text-xs text-zinc-400 mt-0.5">
                         {c?.uid
-                          ? `登录态中的账号（${c.uid.slice(0, 8)}…）尚未导入到账号库`
+                          ? `登录态中的账号（${c.uid.slice(0, 8)}…）尚未导入到账号库，点上方「重新获取已登录账号」即可加入`
                           : c?.authFilePath
                             ? '该档位的登录态文件不存在'
                             : 'WorkBuddy 登录态文件不存在或已损坏'}
