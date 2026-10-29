@@ -111,39 +111,107 @@ export function dataRoot(variant) {
 }
 
 /**
- * 登录态文件的候选路径。两档位**同目录、不同文件**（与 workbuddy-switch 一致）：
- * 国内版 `workbuddy-desktop.info`，国际版 `workbuddy-desktop-ai.info`。
- *
- * 桌面端与 CodeBuddy 扩展各有一份，按存在性择一。
+ * 登录态文件的**基名**（= 客户端 product.json 里的 `authentication.id`）。
+ * 国内版 `workbuddy-desktop`，国际版 `workbuddy-desktop-ai`。
  */
-export function authFileCandidates(variant) {
+export function authFileBaseName(variant) {
+  return getVariant(variant).id === 'ai' ? 'workbuddy-desktop-ai' : 'workbuddy-desktop';
+}
+
+/** 登录态目录候选：桌面端与 CodeBuddy 扩展各一份，按存在性择一 */
+function authDirs() {
   const home = os.homedir();
-  const name = getVariant(variant).id === 'ai' ? 'workbuddy-desktop-ai.info' : 'workbuddy-desktop.info';
   if (process.platform === 'win32') {
     return [
-      path.join(process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'CodeBuddyExtension', 'Data', 'Public', 'auth', name),
-      path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'CodeBuddyExtension', 'Data', 'Public', 'auth', name),
+      path.join(process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
+      path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'CodeBuddyExtension', 'Data', 'Public', 'auth'),
     ];
   }
   if (process.platform === 'darwin') {
-    return [
-      path.join(home, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data', 'Public', 'auth', name),
-    ];
+    return [path.join(home, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data', 'Public', 'auth')];
   }
-  return [
-    path.join(home, '.local', 'share', 'CodeBuddyExtension', 'Data', 'Public', 'auth', name),
-  ];
+  return [path.join(home, '.local', 'share', 'CodeBuddyExtension', 'Data', 'Public', 'auth')];
 }
 
-/** 返回第一个真实存在的登录态文件；都不存在时返回 Windows 默认路径（供报错文案使用） */
+/**
+ * 登录态文件候选路径。两档位**同目录、不同文件**（与 workbuddy-switch 一致）：
+ * 国内版 `workbuddy-desktop.info`，国际版 `workbuddy-desktop-ai.info`。
+ *
+ * 每个档位有两个候选名：基名，以及 `-dev` 变体。
+ *
+ * ## 为什么会有 `-dev`（2026-10-29 反馈：升级 WorkBuddy AI 5.9.3 后切号只重启不生效）
+ *
+ * 客户端 5.9.3 的登录态文件名不再是常量，而是
+ * `join(getSharedAuthDirectory(), `${authentication.id}.info`)`，而
+ * `getWorkbuddyAuthenticationConfiguration()` 在 `NODE_ENV === 'development'` 时
+ * 会把 id 追加成 `${id}-dev`（见 app.asar）。控制台用 `spawn(exe, [], {detached:true})`
+ * 拉起客户端时**继承了自己的环境**，若控制台本身跑在开发态，客户端就会去读写
+ * `workbuddy-desktop-ai-dev.info`——于是控制台写基名文件等于没写。
+ * 现在两份都当作候选：读时按最新修改挑（客户端自己刷新只动它在用的那份），
+ * 写时见 {@link authWriteTargets}。
+ */
+export function authFileCandidates(variant) {
+  const base = authFileBaseName(variant);
+  return authDirs().flatMap((dir) => [
+    path.join(dir, `${base}.info`),
+    path.join(dir, `${base}-dev.info`),
+  ]);
+}
+
+/** 该档位的主文件路径（基名，必定是候选列表的第 0 个） */
+export function authFilePrimaryPath(variant) {
+  return authFileCandidates(variant)[0];
+}
+
+function fileMtimeMs(file) {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * 当前**实际在用**的登录态文件：存在者中 mtime 最新的那个。
+ *
+ * 客户端自己刷新 token 时只重写它在用的那份，所以最新的是"活的"；
+ * 控制台切换会同时写两份（见 {@link authWriteTargets}），不会造成歧义。
+ * 都不存在时返回主文件路径（供报错文案使用）。
+ */
 export function authFilePath(variant) {
   const list = authFileCandidates(variant);
+  let best = null;
+  let bestMs = -1;
   for (const p of list) {
-    try {
-      if (fs.existsSync(p)) return p;
-    } catch {
-      /* 忽略：继续尝试下一个候选 */
+    const ms = fileMtimeMs(p);
+    if (ms > bestMs) {
+      bestMs = ms;
+      best = p;
     }
   }
-  return list[0];
+  return bestMs >= 0 && best ? best : list[0];
+}
+
+/**
+ * 切换 / 回写时要写的目标：主文件必写；`-dev` 变体**已存在**时一并写。
+ *
+ * 只在 `-dev` 已存在时补写，是为了不给一台从没在开发态跑过客户端的机器
+ * 凭空造出一个客户端根本不读的文件。
+ */
+export function authWriteTargets(variant) {
+  const list = authFileCandidates(variant);
+  const primary = list[0];
+  const dev = list.find((p) => p.endsWith('-dev.info'));
+  const targets = [primary];
+  if (dev && fileMtimeMs(dev) >= 0) targets.push(dev);
+  return targets;
+}
+
+/**
+ * 备份标签：沿用历史命名 `workbuddy-desktop-{cn|ai}`，`-dev` 目标追加后缀，
+ * 让 backups.mjs 能把备份归到正确档位。
+ */
+export function authBackupTag(variant, filePath) {
+  const tag = `workbuddy-desktop-${getVariant(variant).id}`;
+  return String(filePath || '').endsWith('-dev.info') ? `${tag}-dev` : tag;
 }

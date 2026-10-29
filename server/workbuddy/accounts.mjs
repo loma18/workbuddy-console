@@ -115,21 +115,63 @@ function profilePhone(account) {
 }
 
 /**
+ * 解析明文 access_token（JWT）里的身份声明。
+ *
+ * 只解码 payload、**不验签**——用途仅限界面展示（邮箱 / 昵称 / 用户名），
+ * 不参与任何鉴权判断。token 是加密信封时返回 null（解不开，交给其它兜底）。
+ */
+function jwtIdentityClaims(account) {
+  const token = account?.access_token;
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length < 3) return null;
+  try {
+    const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    return json && typeof json === 'object' ? json : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 账号的可读身份：账号库字段优先，缺失时用 access_token 的 JWT 声明补。
+ *
+ * ## 为什么需要（2026-10-29 反馈：账号卡片标题显示成一串 uuid）
+ *
+ * 国际版扫码/导入得到的 `profile_raw.nickname`、`phoneNumber` 是**加密信封**
+ * （`{$wbEncrypted, envelope}`），既解不开也读不出；`email` 服务端又没下发明文。
+ * 于是账号库里 nickname / email 都是空串，`accountDisplayName()` 一路兜到 uid，
+ * 界面就把 uuid 当名字显示。而同一账号的 access_token（明文 JWT）里其实带着
+ * `email` / `nickname` / `name` / `preferred_username`，直接取用即可。
+ */
+export function accountIdentity(account) {
+  const claims = jwtIdentityClaims(account) || {};
+  const str = (v) => (typeof v === 'string' ? v.trim() : '');
+  const email = str(account?.email) || str(claims.email);
+  const nickname =
+    str(account?.nickname) || str(claims.nickname) || str(claims.name) || str(claims.given_name);
+  const username = str(claims.preferred_username);
+  // 国内版的 preferred_username 就是手机号；国际版是账号名，不能混用
+  const phone = profilePhone(account) || (/^\+?\d{6,}$/.test(username) ? username : '');
+  return { email, nickname, username, phone };
+}
+
+/**
  * 账号展示名：按本地 displayField 选择，再逐级兜底。
  *
  * - `note` / `auto`：都优先用备注（界面上「自动」写的就是「备注 → 邮箱 → 昵称 → UID」，
  *   之前 auto 分支忘了取备注，导致用户改完备注看不到任何变化）。
  * - `phone`：优先官方手机号，取不到再回落备注。
- * 兜底链：email → nickname → uid → unknown。
+ * 兜底链：email → nickname → preferred_username → uid → unknown。
+ * email / nickname 会先从 JWT 声明补全，避免昵称是加密信封时直接露出 uuid。
  */
 export function accountDisplayName(account) {
   const note = String(account?.note || '').trim();
-  const byField =
-    account?.displayField === 'phone' ? profilePhone(account) || note : note;
-  const email = String(account?.email || '').trim();
-  const nickname = String(account?.nickname || '').trim();
+  const identity = accountIdentity(account);
+  const byField = account?.displayField === 'phone' ? identity.phone || note : note;
   const uid = String(account?.uid || '').trim();
-  return byField || email || nickname || uid || 'unknown';
+  return byField || identity.email || identity.nickname || identity.username || uid || 'unknown';
 }
 
 /**
@@ -138,12 +180,13 @@ export function accountDisplayName(account) {
  */
 export function accountMeta(account) {
   const variant = variantOf(account);
+  const identity = accountIdentity(account);
   return {
     id: account?.id || '',
     uid: account?.uid || '',
     name: accountDisplayName(account),
-    email: String(account?.email || '') || null,
-    nickname: String(account?.nickname || '') || null,
+    email: identity.email || null,
+    nickname: identity.nickname || null,
     note: String(account?.note || '') || null,
     displayField: account?.displayField || 'auto',
     domain: account?.domain || getVariant(variant).apiEndpoint,

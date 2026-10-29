@@ -175,6 +175,8 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 | 国内版 | `workbuddy-desktop.info` |
 | 国际版 | `workbuddy-desktop-ai.info` |
 
+> 客户端跑在开发态（继承到 `NODE_ENV=development`）时，上表两个文件会各自多出一个 `-dev` 变体（`workbuddy-desktop-ai-dev.info`）。控制台把两份都当候选：读时取最新修改的那份，写时见下面的 2026-10-29 修复。
+
 所以可以在国内版登录 A、在国际版登录 B，两边各自「切换账号」不会覆盖对方。账号页顶部会分别显示两档当前登录的是谁，未登录的那档显示为灰色。
 
 几条相关行为：
@@ -187,6 +189,8 @@ node scripts/test-growth.mjs          # 成长中心六模块与补登候选（4
 > **2026-10 修复**：早先"退出 / 重开"写死成 `WorkBuddy` + `WorkBuddy.exe`，于是**切国际版账号时关掉并拉起的是国内版客户端**——国际版那份登录态压根没被重新读取，用户看到的是"两个程序都动了一下，但国际版没换账号"。现在进程名、可执行文件、macOS .app 包都按档位取自 `variant.mjs`，且用另一档的 exe 路径去定位会被明确拒绝（不跨档启动）。
 
 > **2026-10 修复**：`switchAccount()` 曾把档位对象直接传给 `authFilePath()`，`String(对象)` 得到 `[object Object]` 后静默回落国内版——**切换国际版账号会写进国内版文件，把国内版登录态覆盖掉**，表现就是"两档没法分别切换"。现在 `getVariant()` 同时接受对象和 id，三处调用点也都显式传 `variant.id`。
+
+> **2026-10-29 修复**：升级 WorkBuddy AI 5.9.3 后「点切换 → 只重启 → 账号不变」。客户端 5.9.3 的登录态文件名不再是常量，而是 `${authentication.id}.info`，且 `NODE_ENV === 'development'` 时会把 id 追加 `-dev`（见 `app.asar` 的 `getWorkbuddyAuthenticationConfiguration` / `getWorkbuddyAuthFilePath`）。控制台用 `spawn(exe, [], { detached: true })` 拉起客户端时**继承自己的环境**，控制台若来自开发态（electron 开发进程或开发终端），客户端就去读写 `workbuddy-desktop-ai-dev.info`，而控制台写的是 `workbuddy-desktop-ai.info`——写进去了，客户端根本不读。现在两头都补齐：拉起客户端时摘掉 `NODE_ENV`（`clientSpawnEnv()`，让客户端走正式模式的登录态文件），切换 / 恢复备份 / 凭据回写则同时写主文件与**已存在**的 `-dev` 变体，读侧按「最新修改」判定哪份是活的（客户端自己刷新只动它在用的那份）。回归测试：`npm run test:auth-dev`（28 项断言，隔离临时登录态）。
 
 ### 为什么导入国际版后显示「加密凭据」
 
@@ -205,6 +209,18 @@ WorkBuddy 5.6 起会把登录态里的 `accessToken` / `refreshToken` 写成客�
 > 于是国际版导入后 `hasEnvelope` 判不出来，界面落到「无可用凭据」。现在信封原样保留，
 > 并且余额/验活/积分查询会主动跳过加密账号，不会发空 Bearer 再被官方 401 误判成「凭据已失效」。
 > 回归测试：`node scripts/test-import-envelope.mjs`（33 项断言，隔离临时账号库与登录态文件）。
+
+### 账号名怎么取（为什么不会显示一串 uuid）
+
+展示名兜底链：**备注 → 邮箱 → 昵称 → 用户名 → UID**。其中邮箱 / 昵称若在账号库里是空的，
+会从 `access_token`（明文 JWT）交给 `accountIdentity()` 补：国际版扫码后服务端下发的
+`profile_raw.nickname` / `phoneNumber` 是**加密信封**，解不开也读不出，`email` 又没有明文，
+以前就会一路兜到 uid，卡片标题直接显示 uuid。
+
+> **2026-10-29 修复**：国际版账号卡片标题显示 `4a9dc61a-…` 这类 uuid。现在从 JWT 声明里取
+> `email` / `nickname` / `name` / `preferred_username` 补全（只解码不验签，仅用于展示），
+> 同一账号会显示成 `909622852@163.com`（昵称「马正贤」）；国内版缺昵称的账号也会显示成 JWT 里的昵称。
+> 不改写账号库文件，`workbuddy-switch` 那边的数据保持原样。
 
 ## 手机同步（局域网）
 

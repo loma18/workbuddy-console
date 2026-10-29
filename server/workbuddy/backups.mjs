@@ -13,10 +13,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { BACKUP_DIR, backupAuthFile } from './accounts.mjs';
-import { VARIANT_LIST, getVariant, authFilePath } from './variant.mjs';
+import { VARIANT_LIST, getVariant, authFilePath, authWriteTargets } from './variant.mjs';
 
-/** 备份文件名可能来自本工具（-cn / -ai 后缀）或 workbuddy-switch（无 cn 后缀） */
+/** 备份文件名可能来自本工具（-cn / -ai / -dev 后缀）或 workbuddy-switch（无 cn 后缀） */
 const TAG_TO_VARIANT = [
+  // `-dev` 在前：客户端开发态用的 `workbuddy-desktop-ai-dev.info` 也要归到国际版
+  { tag: 'workbuddy-desktop-ai-dev', variant: 'ai' },
+  { tag: 'workbuddy-desktop-cn-dev', variant: 'cn' },
   { tag: 'workbuddy-desktop-ai', variant: 'ai' },
   { tag: 'workbuddy-desktop-cn', variant: 'cn' },
   { tag: 'workbuddy-desktop', variant: 'cn' },
@@ -118,29 +121,37 @@ export function restoreBackup(name) {
   const variant = getVariant(variantId);
   const raw = readAuthContent(full);
 
-  const target = authFilePath(variant);
+  /**
+   * 恢复也要覆盖**客户端真正在读的那份**：主文件 + 已存在的 `-dev` 变体
+   * （否则客户端跑在开发态时，恢复了备份也看不到变化）。
+   */
+  const targets = authWriteTargets(variant.id);
+  const target = targets[0] || authFilePath(variant);
   fs.mkdirSync(path.dirname(target), { recursive: true });
 
   // 先把「当前」文件另存一份，恢复本身也可回退
   const safety = backupAuthFile(target, `workbuddy-desktop-${variant.id}`);
 
-  const tmp = `${target}.tmp-${process.pid}`;
-  try {
-    fs.writeFileSync(tmp, raw, 'utf8');
-    fs.renameSync(tmp, target);
-  } catch (e) {
+  for (const t of targets) {
+    const tmp = `${t}.tmp-${process.pid}`;
     try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* 临时文件可能未生成 */
+      fs.writeFileSync(tmp, raw, 'utf8');
+      fs.renameSync(tmp, t);
+    } catch (e) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* 临时文件可能未生成 */
+      }
+      throw new Error(`写入登录态文件失败：${e?.message || e}`);
     }
-    throw new Error(`写入登录态文件失败：${e?.message || e}`);
   }
 
   return {
     ok: true,
     restored: base,
     authFilePath: target,
+    authFilePaths: targets,
     safetyBackup: safety,
     variant: { id: variant.id, label: variant.label },
   };

@@ -12,7 +12,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { authFilePath, getVariant, variantOf, VARIANT_LIST } from './variant.mjs';
+import { authFilePath, authWriteTargets, authBackupTag, authFilePrimaryPath, getVariant, variantOf, VARIANT_LIST } from './variant.mjs';
 import {
   findAccount,
   loadAccounts,
@@ -34,6 +34,53 @@ export function readAuthFile(variant) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 原子写一份登录态文件（tmp → rename），失败不留半成品。
+ *
+ * 单独抽出来是因为切换与凭据回写都要写**多份**（主文件 + 客户端开发态用的
+ * `-dev` 文件），逐个文件重复这段逻辑容易漏掉"临时文件清理"这类边界。
+ */
+function writeAuthDocFile(target, doc) {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = `${target}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* 临时文件可能未生成 */
+    }
+    throw new Error(`写入登录态文件失败（${path.basename(target)}）：${err?.message || err}`);
+  }
+}
+
+/**
+ * 写一份目标文件并回读校验；校验不过立刻用备份回滚。
+ *
+ * 返回 `{ ok, backup }`。`expectedToken` 为明文 token 时做精确比对；
+ * 加密信封无法比对，只校验结构（与历史行为一致）。
+ */
+function writeOneAuthTarget(target, doc, expectedToken, tag) {
+  const backup = backupAuthFile(target, tag);
+  writeAuthDocFile(target, doc);
+  let verify = null;
+  try {
+    verify = JSON.parse(fs.readFileSync(target, 'utf8'));
+  } catch {
+    verify = null;
+  }
+  const structOk = !!verify && typeof verify === 'object' && !!verify.auth;
+  const tokenOk =
+    typeof expectedToken !== 'string' || !expectedToken || verify?.auth?.accessToken === expectedToken;
+  if (!structOk || !tokenOk) {
+    if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, target);
+    return { ok: false, backup, reason: structOk ? 'token-mismatch' : 'bad-structure' };
+  }
+  return { ok: true, backup };
 }
 
 /**
@@ -153,7 +200,6 @@ export function syncTokensToAuthFile(account, { authPath: overridePath = null } 
 
   const auth = doc.auth && typeof doc.auth === 'object' ? doc.auth : {};
   const now = Date.now();
-  const before = { accessToken: auth.accessToken, refreshToken: auth.refreshToken };
   auth.accessToken = access;
   if (typeof refresh === 'string' && refresh) auth.refreshToken = refresh;
   auth.lastRefreshTime = now;
@@ -169,41 +215,23 @@ export function syncTokensToAuthFile(account, { authPath: overridePath = null } 
   }
   doc.auth = auth;
 
-  const backup = backupAuthFile(authPath, `authsync-${variant.id}`);
-  const tmp = `${authPath}.tmp-${process.pid}`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
-    fs.renameSync(tmp, authPath);
-  } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* 临时文件可能未生成 */
-    }
-    return { synced: false, reason: `write-failed: ${err?.message || err}` };
+  /**
+   * 写目标：调用方指定就只写指定的（测试注入临时文件），否则写**全部**在用文件
+   * ——主文件，以及客户端开发态下真正在用的 `-dev` 变体。
+   */
+  const targets = overridePath ? [overridePath] : authWriteTargets(variant.id);
+  const backups = [];
+  for (const target of targets) {
+    const one = writeOneAuthTarget(target, doc, access, `authsync-${variant.id}`);
+    if (!one.ok) return { synced: false, reason: `verify-failed: ${path.basename(target)}` };
+    backups.push(one.backup);
   }
-  // 回读校验：写坏了立刻回滚，绝不留下半成品登录态（按 authPath 读，测试可注入临时文件）
-  let verify = null;
-  try {
-    verify = JSON.parse(fs.readFileSync(authPath, 'utf8'));
-  } catch {
-    verify = null;
-  }
-  if (!verify || verify?.auth?.accessToken !== access) {
-    if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, authPath);
-    else {
-      // 没有备份（理论上不会发生）时至少把内存里的旧值写回
-      try {
-        doc.auth.accessToken = before.accessToken;
-        doc.auth.refreshToken = before.refreshToken;
-        fs.writeFileSync(authPath, JSON.stringify(doc, null, 2), 'utf8');
-      } catch {
-        /* 只能放弃 */
-      }
-    }
-    return { synced: false, reason: 'verify-failed' };
-  }
-  return { synced: true, authFilePath: authPath, backupPath: backup };
+  return {
+    synced: true,
+    authFilePath: targets[0],
+    authFilePaths: targets,
+    backupPath: backups[0] || null,
+  };
 }
 
 /**
@@ -225,8 +253,17 @@ export function switchAccount(accountId) {
     );
   }
 
-  const authPath = authFilePath(variant.id);
-  fs.mkdirSync(path.dirname(authPath), { recursive: true });
+  /**
+   * 写目标：主文件 + 客户端在开发态下真正在用的 `-dev` 变体（存在才写）。
+   *
+   * 只写主文件是不够的：客户端 5.9.3 若跑在 `NODE_ENV=development` 下会改读
+   * `workbuddy-desktop-ai-dev.info`，那样"写成功 + 重启"仍然换不了账号
+   * （2026-10-29 反馈：升级后点切换只重启、账号不变）。两份内容完全一致，
+   * 无论客户端走哪条分支都能读到新账号。
+   */
+  const targets = authWriteTargets(variant.id);
+  const primaryPath = targets[0] || authFilePrimaryPath(variant.id);
+  fs.mkdirSync(path.dirname(primaryPath), { recursive: true });
 
   const accountObj = buildAccountObject(account);
   const authObj = buildAuthObject(account);
@@ -237,40 +274,28 @@ export function switchAccount(accountId) {
     auth: authObj,
   };
 
-  // 切换前备份（即使当前文件不存在也无妨，返回 null）
-  const backup = backupAuthFile(authPath, `workbuddy-desktop-${variant.id}`);
-
-  const tmp = `${authPath}.tmp-${process.pid}`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8');
-    fs.renameSync(tmp, authPath);
-  } catch (err) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* 临时文件可能未生成 */
+  const backups = [];
+  for (const target of targets) {
+    // 切换前备份（即使当前文件不存在也无妨，返回 null）
+    const tag = authBackupTag(variant.id, target);
+    const one = writeOneAuthTarget(target, doc, authObj.accessToken, tag);
+    if (!one.ok) {
+      throw new Error(
+        one.reason === 'token-mismatch'
+          ? `登录态文件回读校验失败（token 不一致，${path.basename(target)}），已回滚到切换前的备份`
+          : `登录态文件回读校验失败（${path.basename(target)}），已回滚到切换前的备份`
+      );
     }
-    throw new Error(`写入登录态文件失败：${err?.message || err}`);
-  }
-
-  // 回读校验：结构不对立刻回滚，绝不留下半成品登录态
-  const verify = readAuthFile(variant);
-  if (!verify || typeof verify !== 'object' || !verify.auth) {
-    if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, authPath);
-    throw new Error('登录态文件回读校验失败，已回滚到切换前的备份');
-  }
-  // 校验 token 是否真的写进去了（信封原样写回，明文可直接比对）
-  const written = verify.auth.accessToken;
-  const expected = authObj.accessToken;
-  if (typeof expected === 'string' && expected && written !== expected) {
-    if (backup && fs.existsSync(backup)) fs.copyFileSync(backup, authPath);
-    throw new Error('登录态文件回读校验失败（token 不一致），已回滚到切换前的备份');
+    backups.push(one.backup);
   }
 
   return {
     ok: true,
-    backupPath: backup,
-    authFilePath: authPath,
+    backupPath: backups[0] || null,
+    /** 主文件（界面与备份文案以它为准） */
+    authFilePath: primaryPath,
+    /** 实际写入的全部文件，便于诊断"客户端到底读哪份" */
+    authFilePaths: targets,
     variant: variant.id,
     account: accountMeta(account),
     /** 切换后需要重启 WorkBuddy 才会生效 */

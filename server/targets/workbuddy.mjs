@@ -858,6 +858,30 @@ export async function stopWorkbuddy({
 }
 
 /**
+ * 拉起客户端时用的环境变量。
+ *
+ * ## 为什么要摘掉 `NODE_ENV`（2026-10-29 反馈：升级 WorkBuddy AI 5.9.3 后切号"只重启不生效"）
+ *
+ * 客户端 5.9.3 的登录态文件名由 `getWorkbuddyAuthenticationConfiguration()` 决定，
+ * 而该函数在 `NODE_ENV === 'development'` 时会把 `authentication.id` 追加 `-dev`，
+ * 于是读写的是 `workbuddy-desktop-ai-dev.info`，而不是控制台对应的
+ * `workbuddy-desktop-ai.info`——写进去的账号客户端压根不读。
+ *
+ * 控制台用 `spawn(exe, [], { detached: true })` 拉起客户端时**继承自己的环境**，
+ * 控制台自身若是从开发态（electron 开发进程 / 开发终端）启动的，这个 development
+ * 就会一路传到客户端。用户手动从开始菜单打开客户端时没有这个变量，所以表现为
+ * "控制台切号无效、手动重启就生效"。
+ *
+ * 这里显式摘掉，让客户端无论被谁拉起都走正式模式的登录态文件；写侧另有
+ * `authWriteTargets()` 兜底同步 `-dev` 文件，两头都不依赖对方。
+ */
+export function clientSpawnEnv() {
+  const env = { ...process.env };
+  delete env.NODE_ENV;
+  return env;
+}
+
+/**
  * 重新打开**指定档位**的客户端（切换账号后调用，让用户拿到一个已登录新账号的客户端）。
  * Windows 用 exe 直接拉起；macOS 从检测到的可执行文件路径反推 .app 包后用 `open`。
  *
@@ -884,7 +908,7 @@ export function launchWorkbuddy(exePath, variant = 'cn') {
       `未能定位 ${label} 可执行文件，请手动重新打开 ${label}。` + (exePath ? `（检测到的路径：${exePath}）` : '')
     );
   }
-  const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
+  const child = spawn(exe, [], { detached: true, stdio: 'ignore', env: clientSpawnEnv() });
   child.unref();
   return { launched: true, exePath: exe };
 }
@@ -931,7 +955,7 @@ export async function restartWorkbuddy({ variant = 'cn' } = {}) {
           (proc.exePath ? `（检测到的路径：${proc.exePath}）` : '')
       );
     }
-    const child = spawn(exe, [], { detached: true, stdio: 'ignore' });
+    const child = spawn(exe, [], { detached: true, stdio: 'ignore', env: clientSpawnEnv() });
     child.unref();
     return { restarted: true, exePath: exe };
   }

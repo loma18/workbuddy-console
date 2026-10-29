@@ -38,7 +38,8 @@
     "app": "electron .",
     "app:dir": "npm run build && electron-builder --dir --publish never",
     "app:win": "npm run build && electron-builder --win --publish never",
-    "app:mac": "npm run build && electron-builder --mac --publish never"
+    "app:mac": "npm run build && electron-builder --mac --publish never",
+    "test:auth-dev": "node scripts/test-auth-dev-file.mjs"
   },
   "dependencies": {
     "express": "^4.21.0",
